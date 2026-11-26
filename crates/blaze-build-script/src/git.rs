@@ -209,6 +209,12 @@ pub enum Question {
     /// `rev-parse --git-dir`: the repository's own git folder, as a path from the folder asked
     /// in ([`relative_to`]).
     GitDir,
+    /// `rev-parse --absolute-git-dir`: the same folder as an absolute path, which in the
+    /// sandbox is the mount's ([`blaze_expand::seen::WORKSPACE_ROOT`]): a repository is found
+    /// only in a checkout's served tree, and a checkout is served there. It names the folder the
+    /// script then reads (everything-client's build.rs: `<gitdir>/HEAD` as `rerun-if-changed`)
+    /// and holds nothing of the machine (rule 25).
+    AbsoluteGitDir,
     /// `rev-parse --git-common-dir`: the folder holding refs and objects (a linked worktree's
     /// `commondir`), from the folder asked in.
     CommonDir,
@@ -218,8 +224,12 @@ pub enum Question {
     ShowCurrent,
     /// The full name of the ref HEAD points to.
     SymbolicRef,
-    /// An abbreviated commit (`--short`).
+    /// An abbreviated commit (`--short`) in a form not answered ([`Question::ShortHead`]).
     Short,
+    /// `rev-parse [--verify] --short[=N] HEAD`: HEAD's commit abbreviated as git does
+    /// (`find_unique_abbrev`): `least` hex digits (git's automatic length when `None`, `--short`
+    /// alone), lengthened until no other object shares the prefix.
+    ShortHead { least: Option<usize> },
     /// `status --porcelain`, listing untracked files when `untracked` (git's default) and not
     /// with `--untracked-files=no`; `all` selects `--untracked-files=all` instead of Git's
     /// directory-collapsed default.
@@ -245,12 +255,21 @@ pub fn question(args: &[&str]) -> Question {
         ["rev-parse", "--is-inside-work-tree"] => Question::InsideWorkTree,
         ["rev-parse", "HEAD"] | ["rev-parse", "--verify", "HEAD"] => Question::Head,
         ["rev-parse", "--git-dir"] => Question::GitDir,
+        ["rev-parse", "--absolute-git-dir"] => Question::AbsoluteGitDir,
         ["rev-parse", "--git-common-dir"] => Question::CommonDir,
         ["rev-parse", "--abbrev-ref", "HEAD"]
         | ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "HEAD"]
         | ["rev-parse", "--symbolic-full-name", "--abbrev-ref", "HEAD"] => Question::Branch,
         ["branch", "--show-current"] => Question::ShowCurrent,
         ["symbolic-ref", "HEAD"] => Question::SymbolicRef,
+        ["rev-parse", "--short", "HEAD"] | ["rev-parse", "--verify", "--short", "HEAD"] | ["rev-parse", "--short", "--verify", "HEAD"] => {
+            Question::ShortHead { least: None }
+        }
+        ["rev-parse", short, "HEAD"] | ["rev-parse", "--verify", short, "HEAD"] | ["rev-parse", short, "--verify", "HEAD"]
+            if short_length(short).is_some() =>
+        {
+            Question::ShortHead { least: short_length(short) }
+        }
         ["rev-parse", rest @ ..] if rest.iter().any(|arg| *arg == "--short" || arg.starts_with("--short=")) => Question::Short,
         ["status", "--porcelain"] => Question::Status { untracked: true, all: false },
         ["status", "--porcelain", "--untracked-files=no"] | ["status", "--porcelain", "-uno"] => Question::Status { untracked: false, all: false },
@@ -263,6 +282,17 @@ pub fn question(args: &[&str]) -> Question {
         ["show", "-s" | "--no-patch", format] | ["show", "-s" | "--no-patch", format, "HEAD"] => log_format(format),
         _ => Question::Other,
     }
+}
+
+/// `--short=<n>`'s length as git takes it (rev-parse.c: `abbrev = strtoul(arg, NULL, 10)`,
+/// then below `MINIMUM_ABBREV` 4 it is 4 and above the hash's 40 hex digits it is 40); `None`
+/// for any other word, or a length not all digits.
+fn short_length(word: &str) -> Option<usize> {
+    let digits = word.strip_prefix("--short=")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(digits.parse::<usize>().unwrap_or(40).clamp(4, 40))
 }
 
 /// A `log`/`show` format argument: `--pretty=format:<f>` (no newline after the one commit),
@@ -576,7 +606,9 @@ pub fn answer<'a>(question: Question, folder: &str, vcs: Vcs, files: &mut impl G
             Question::SymbolicRef => Ok(Answer { code: 128, stdout: String::new_in(alloc), stderr: "fatal: ref HEAD is not a symbolic ref\n" }),
             // Clean: no tracked file differs from the commit, and no file is untracked.
             Question::Status { .. } => Ok(ok("")),
-            Question::Short => Err(Refused::Short),
+            // The record keeps the commit id, not the object store the abbreviation is made
+            // unique among.
+            Question::Short | Question::ShortHead { .. } => Err(Refused::Short),
             Question::Log(Err(why)) => Err(why),
             // The record keeps the commit id, not the commit object (D54): git's own failure,
             // which every unit asking tolerates with no value (smolgen: no commit-date keys).
@@ -590,7 +622,7 @@ pub fn answer<'a>(question: Question, folder: &str, vcs: Vcs, files: &mut impl G
             Question::Describe { always: true, .. } => Ok(ok(&hex[..FALLBACK_DEFAULT_ABBREV])),
             // A fetched source serves no `.git` folder to name: a script would read files under
             // it that are not there.
-            Question::GitDir | Question::CommonDir | Question::Dirty | Question::Other => Err(Refused::CannotAnswerYet),
+            Question::GitDir | Question::AbsoluteGitDir | Question::CommonDir | Question::Dirty | Question::Other => Err(Refused::CannotAnswerYet),
         };
     }
     match question {
@@ -615,6 +647,14 @@ pub fn answer<'a>(question: Question, folder: &str, vcs: Vcs, files: &mut impl G
     match question {
         Question::InsideWorkTree => return Ok(ok("true")),
         Question::GitDir => return Ok(ok(&relative_to(folder, &repo.gitdir, alloc))),
+        Question::AbsoluteGitDir => {
+            let mut path = String::from_str_in(blaze_expand::seen::WORKSPACE_ROOT, alloc);
+            for part in repo.gitdir.split('/').filter(|part| !part.is_empty()) {
+                path.push('/');
+                path.push_str(part);
+            }
+            return Ok(ok(&path));
+        }
         Question::CommonDir => return Ok(ok(&relative_to(folder, &repo.common, alloc))),
         Question::Log(Ok(format)) => {
             let commit = head_commit(&repo, files, alloc)?;
@@ -650,6 +690,13 @@ pub fn answer<'a>(question: Question, folder: &str, vcs: Vcs, files: &mut impl G
             let tree = head_tree(&repo, files, alloc)?;
             let stdout = crate::git_objects::status(&repo.gitdir, &repo.common, &repo.work, untracked, all, tree, files, alloc)?;
             return Ok(Answer { code: 0, stdout, stderr: "" });
+        }
+        Question::ShortHead { least } => {
+            let commit = head_commit(&repo, files, alloc)?;
+            let store = crate::git_objects::Store::open(&repo.common, files, alloc)?;
+            let len = store.abbrev_at_least(&commit, least, files, alloc)?;
+            let hex = commit.hex();
+            return Ok(ok(core::str::from_utf8(&hex[..len]).expect("hex")));
         }
         Question::Describe { always, dirty } => {
             let commit = head_commit(&repo, files, alloc)?;

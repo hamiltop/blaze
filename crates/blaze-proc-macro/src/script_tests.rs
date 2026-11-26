@@ -538,7 +538,7 @@ fn no_repository_is_gits_own_answer() {
         (answer.code, answer.stdout.as_str().to_owned(), answer.stderr, reads)
     };
     let (_, bare) = checkout("git-none", &[("core/build.rs", "fn main() {}\n")]);
-    for args in [&["rev-parse", "--git-dir"][..], &["rev-parse", "--git-common-dir"], &["rev-parse", "HEAD"], &["show", "-s", "--format=%ct", "HEAD"]] {
+    for args in [&["rev-parse", "--git-dir"][..], &["rev-parse", "--absolute-git-dir"], &["rev-parse", "--git-common-dir"], &["rev-parse", "HEAD"], &["show", "-s", "--format=%ct", "HEAD"]] {
         let (code, stdout, stderr, reads) = full(&bare, "core", args);
         println!("no repository, git {args:?}: {code} {stderr:?}");
         assert_eq!((code, stdout.as_str(), stderr), (128, "", git::NOT_A_REPOSITORY));
@@ -554,8 +554,18 @@ fn no_repository_is_gits_own_answer() {
     );
     assert_eq!(ask(&repo, "core", &["rev-parse", "--git-dir"]).0, Ok((0, "../.git\n".to_owned())));
     assert_eq!(ask(&repo, "", &["rev-parse", "--git-dir"]).0, Ok((0, ".git\n".to_owned())));
+    // everything-client's build.rs (e9, 2026-11-25) asks `--absolute-git-dir`: the mount's
+    // path in any folder, never the machine's.
+    assert_eq!(ask(&repo, "core", &["rev-parse", "--absolute-git-dir"]).0, Ok((0, "/workspace/.git\n".to_owned())));
+    assert_eq!(ask(&repo, "", &["rev-parse", "--absolute-git-dir"]).0, Ok((0, "/workspace/.git\n".to_owned())));
     assert_eq!(ask(&repo, "core", &["rev-parse", "--git-common-dir"]).0, Ok((0, "../.git\n".to_owned())));
     assert_eq!(ask(&repo, "core", &["rev-parse", "HEAD"]).0, Ok((0, format!("{COMMIT_A}\n"))));
+    // everything-client's build.rs asks `--short=12 HEAD`: at least the length asked, as git
+    // lengthens it only while another object shares the prefix (none here); `--short` alone is
+    // git's automatic 7 under 2^14 objects.
+    assert_eq!(ask(&repo, "core", &["rev-parse", "--short=12", "HEAD"]).0, Ok((0, format!("{}\n", &COMMIT_A[..12]))));
+    assert_eq!(ask(&repo, "core", &["rev-parse", "--short", "HEAD"]).0, Ok((0, format!("{}\n", &COMMIT_A[..7]))));
+    assert_eq!(ask(&repo, "core", &["rev-parse", "--short=2", "HEAD"]).0, Ok((0, format!("{}\n", &COMMIT_A[..4]))));
     println!("a repository, git rev-parse --git-dir in core: ../.git");
 
     for tree in [&bare, &repo] {
@@ -577,8 +587,10 @@ fn no_repository_is_gits_own_answer() {
 fn git_refuses_by_name_what_it_cannot_answer_exactly() {
     let (_, unborn) = checkout("git-refusals", &[(".git/HEAD", "ref: refs/heads/unborn\n")]);
     assert_eq!(ask(&unborn, "", &["rev-parse", "HEAD"]).0, Err(git::Refused::NoCommit));
-    assert_eq!(ask(&unborn, "", &["rev-parse", "--short", "HEAD"]).0, Err(git::Refused::Short));
-    assert_eq!(ask(&unborn, "", &["rev-parse", "--short=8", "HEAD"]).0, Err(git::Refused::Short));
+    assert_eq!(ask(&unborn, "", &["rev-parse", "--short", "HEAD"]).0, Err(git::Refused::NoCommit));
+    assert_eq!(ask(&unborn, "", &["rev-parse", "--short=8", "HEAD"]).0, Err(git::Refused::NoCommit));
+    // A `--short` of anything but HEAD is still refused by name.
+    assert_eq!(ask(&unborn, "", &["rev-parse", "--short", "main"]).0, Err(git::Refused::Short));
     assert_eq!(ask(&unborn, "", &["status", "--porcelain"]).0, Err(git::Refused::NoCommit));
     assert_eq!(ask(&unborn, "", &["status", "--short"]).0, Err(git::Refused::Dirty));
     // `--dirty` is answered (from the tracked status); another mark is not.
