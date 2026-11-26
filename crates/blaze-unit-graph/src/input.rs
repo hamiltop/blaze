@@ -143,18 +143,41 @@ pub struct Package<'a> {
     pub patched_from: AVec<'a, Text<'a>>,
 }
 
+/// `root` (a target's root as the layout reads it, relative to the workspace's root) relative
+/// to the package directory `dir` (relative to that root too; empty for the root package):
+/// the path past `dir` when `root` is under it, else `..` once per segment of `dir` past the
+/// part the two share (`[[bin]] path = "../runtime/src/main.rs"`, which cargo builds). Before:
+/// such a root came back workspace-relative, and joined onto the package's folder it named a
+/// file that is not there (`crates/runtime-it/crates/runtime/src/main.rs`).
+pub fn package_relative<'a>(dir: &str, root: &str, alloc: Alloc<'a>) -> Text<'a> {
+    if dir.is_empty() {
+        return String::from_str_in(root, alloc);
+    }
+    if let Some(under) = root.strip_prefix(dir).and_then(|r| r.strip_prefix('/')) {
+        return String::from_str_in(under, alloc);
+    }
+    let file = || root.split('/').filter(|s| !s.is_empty() && *s != ".");
+    let dirs = || dir.split('/').filter(|s| !s.is_empty() && *s != ".");
+    let common = file().zip(dirs()).take_while(|(a, b)| a == b).count();
+    let mut out = String::new_in(alloc);
+    for _ in common..dirs().count() {
+        out.push_str("../");
+    }
+    for (i, segment) in file().skip(common).enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(segment);
+    }
+    out
+}
+
 impl<'a> Package<'a> {
     /// The facts of a package the layout read; `dir` is its directory (the member's `dir`),
     /// which target roots are made relative to.
     pub fn from_member(member: &Member<'_>, alloc: Alloc<'a>) -> Package<'a> {
         let own = |s: &str| String::from_str_in(s, alloc);
-        let relative = |root: &str| {
-            let dir = member.dir.as_str();
-            match dir.is_empty() {
-                true => own(root),
-                false => own(root.strip_prefix(dir).and_then(|r| r.strip_prefix('/')).unwrap_or(root)),
-            }
-        };
+        let relative = |root: &str| package_relative(member.dir.as_str(), root, alloc);
         let lib = member.lib.as_ref().map(|lib| Lib { crate_name: own(&lib.name), root: relative(&lib.root), proc_macro: lib.proc_macro });
         let mut bins = Vec::with_capacity_in(member.bins.len(), alloc);
         for bin in member.bins.iter() {
@@ -167,8 +190,8 @@ impl<'a> Package<'a> {
             required_features.dedup();
             bins.push(Bin { name: own(&bin.name), root: relative(&bin.root), required_features });
         }
-        // The layout keeps every such root under the package's directory, so `relative` never
-        // leaves one anchor-relative here (a unit's root holds nothing of the checkout).
+        // A root above the package's directory comes out `..`-led ([`package_relative`]), never
+        // anchor-relative (a unit's root holds nothing of the checkout).
         let mut extras = Vec::with_capacity_in(member.extras.len(), alloc);
         for target in member.extras.iter() {
             extras.push(Extra::of(target, relative(&target.root), alloc));

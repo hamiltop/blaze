@@ -653,3 +653,14 @@ fn a_dependencys_records_are_equal_in_two_workspaces() {
     }
     std::println!("D96 P1: {equal} crates' records equal in two workspaces");
 }
+
+/// A member's `..`-led root (blaze-scope units.rs `joined_root_climbing`) climbs out of the
+/// folder it is joined onto, so the crate's root is the file cargo builds.
+#[test]
+fn a_dot_dot_led_root_climbs_out_of_its_folder() {
+    let g = Alloc::global();
+    assert_eq!(super::join("/0/crates/runtime-it/", "../runtime/src/main.rs", g).as_str(), "/0/crates/runtime/src/main.rs");
+    assert_eq!(super::join("/0/crates/runtime-it", "../runtime/src/main.rs", g).as_str(), "/0/crates/runtime/src/main.rs");
+    assert_eq!(super::join("/0/a/b/", "../../c.rs", g).as_str(), "/0/c.rs");
+    assert_eq!(super::join("/0/crates/a/", "src/lib.rs", g).as_str(), "/0/crates/a/src/lib.rs");
+}

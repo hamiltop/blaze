@@ -301,3 +301,28 @@ fn a_member_proc_macro_resolves_its_dependencies_on_the_macro_side() {
     );
     assert_eq!(crates.refusal(5), Some(&UnitsError::NoMacroToolchain { krate: "pm", target: MACRO }));
 }
+
+/// A member's root written above its own folder (`[[bin]] path = "../shared/src/main.rs"`,
+/// which cargo builds) keeps its leading `..`s for the world to resolve against the member's
+/// folder; a package's is refused, as cargo packages only the files under its folder. Before:
+/// the member's was refused too (`RootLeavesPackage`), so no workspace with such a bin checked.
+#[test]
+fn a_members_root_may_climb_above_its_folder_and_a_packages_may_not() {
+    let bytes = toolchain();
+    let view = ToolchainView::open(&bytes, ToolchainView::id_of_bytes(&bytes)).expect("its own id");
+    let lock = Lock::read(LOCK.as_bytes(), a()).expect("the lock");
+    let members = [member(0)];
+
+    let mut app = unit(0, "app", UnitKind::Bin(t("app")), false, &[]);
+    app.root = t("../shared/./src/main.rs");
+    let g = graph(std::vec![app]);
+    let crates = unit_crates(&g, &lock, &members, view, TRIPLE, a()).expect("the crates");
+    let app = crates.crates.iter().find(|c| c.name == "app").expect("app is a crate");
+    assert_eq!(app.root.as_str(), "/package/0/../shared/src/main.rs");
+
+    let mut dep = unit(1, "dep", UnitKind::Lib, false, &[]);
+    dep.root = t("../elsewhere/lib.rs");
+    let g = graph(std::vec![unit(0, "app", UnitKind::Lib, false, &[("dep", 1)]), dep]);
+    let refused = unit_crates(&g, &lock, &members, view, TRIPLE, a()).err();
+    assert_eq!(refused, Some(UnitsError::RootLeavesPackage { krate: "dep", root: "../elsewhere/lib.rs" }));
+}

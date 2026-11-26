@@ -1605,3 +1605,17 @@ fn record_encode_cfg_is_accepts_valid_and_rejects_mutated() {
     assert!(record::encode(&graph, &target, &host, a()).is_err(), "missing cfg atom rejected");
     graph.units[0].cfg = saved;
 }
+
+/// A target root under its package's directory is the path past it; one written above it
+/// (`[[bin]] path = "../runtime/src/main.rs"`) is `..`-led, never the workspace-relative path,
+/// which joined onto the package's folder named a file that is not there.
+#[test]
+fn a_root_above_its_package_is_dot_dot_led() {
+    let g = blaze_own::Alloc::global();
+    let rel = |dir: &str, root: &str| crate::input::package_relative(dir, root, g).as_str().to_owned();
+    assert_eq!(rel("crates/a", "crates/a/src/lib.rs"), "src/lib.rs");
+    assert_eq!(rel("", "src/main.rs"), "src/main.rs");
+    assert_eq!(rel("crates/runtime-it", "crates/runtime/src/main.rs"), "../runtime/src/main.rs");
+    assert_eq!(rel("crates/deep/pkg", "shared/main.rs"), "../../../shared/main.rs");
+    assert_eq!(rel("crates/ab", "crates/a/src/lib.rs"), "../a/src/lib.rs", "a sibling sharing a name prefix is not under it");
+}

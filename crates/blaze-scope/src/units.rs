@@ -382,7 +382,16 @@ pub fn unit_crates<'a>(
         }
         let name = u.crate_name.as_str();
         let base = numbered("/package/", u.package.0, alloc);
-        let root = joined_root(&base, u.root.as_str(), alloc).ok_or(UnitsError::RootLeavesPackage { krate: name, root: u.root.as_str() })?;
+        // A member's root may be written above its own folder (`[[bin]] path = "../x/src/main.rs"`,
+        // which cargo builds): its `..`s stay in the text, and the world resolves them against
+        // the folder it placed the member at (blaze-world list.rs). A package's may not: cargo
+        // packages only the files under its folder.
+        let is_member = members.iter().any(|m| m.id == u.package);
+        let root = match is_member {
+            true => joined_root_climbing(&base, u.root.as_str(), alloc),
+            false => joined_root(&base, u.root.as_str(), alloc),
+        }
+        .ok_or(UnitsError::RootLeavesPackage { krate: name, root: u.root.as_str() })?;
         let mut deps = AVec::new_in(alloc);
         // A proc macro's code's dependencies are the host's, not in this list (a member's are
         // pointed at the macro side's copies by `macro_side`).
@@ -603,6 +612,39 @@ fn joined_root<'a>(base: &str, root: &str, alloc: Alloc<'a>) -> Option<Text<'a>>
         }
     }
     let mut out = Text::from_str_in(base, alloc);
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push_str("/");
+        }
+        out.push_str(part);
+    }
+    Some(out)
+}
+
+/// [`joined_root`] for a member's root, whose leading `..`s (and only leading ones: a `..` after
+/// a named segment is taken out by text) are kept after `base`, as cargo keeps them: the root is
+/// read by the world from the member's own folder, never from `base`. `None` for an empty root.
+fn joined_root_climbing<'a>(base: &str, root: &str, alloc: Alloc<'a>) -> Option<Text<'a>> {
+    let mut climbs = 0usize;
+    let mut parts: AVec<'_, &str> = AVec::new_in(alloc);
+    for part in root.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    climbs += 1;
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut out = Text::from_str_in(base, alloc);
+    for _ in 0..climbs {
+        out.push_str("../");
+    }
     for (i, part) in parts.iter().enumerate() {
         if i > 0 {
             out.push_str("/");

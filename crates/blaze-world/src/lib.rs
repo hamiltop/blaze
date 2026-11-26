@@ -474,7 +474,18 @@ impl fmt::Display for WorldError<'_> {
 fn join<'w>(a: &str, b: &str, alloc: Alloc<'w>) -> AString<'w> {
     let mut out = AString::with_capacity_in(a.len() + b.len() + 1, alloc);
     out.push_str(a);
-    if !a.is_empty() && !b.is_empty() && !a.ends_with('/') {
+    // A leading `..` of `b` (a member's root above its own directory) climbs out of `a`.
+    let mut b = b;
+    while let Some(rest) = b.strip_prefix("../") {
+        let trimmed = out.trim_end_matches('/').len();
+        out.truncate(trimmed);
+        match out.rfind('/') {
+            Some(at) => out.truncate(at + 1),
+            None => out.clear(),
+        }
+        b = rest;
+    }
+    if !out.is_empty() && !b.is_empty() && !out.ends_with('/') {
         out.push_str("/");
     }
     out.push_str(b);
