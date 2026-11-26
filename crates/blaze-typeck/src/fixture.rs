@@ -87,6 +87,8 @@ pub struct Fx {
     /// Return-position `impl Trait` occurrences: each one's bounds, `Self` the occurrence's
     /// `Opaque(k, generics in scope)`, as the front end answers `Predicates(k)`.
     opaques: Vec<(ItemKey, Vec<PClause>)>,
+    /// An ADT's own where-clauses ([`Fx::set_adt_clauses`]), its `predicates` answer.
+    adt_clauses: Vec<(ItemKey, Vec<PClause>)>,
     /// Closures of other bodies (`PNode::Closure`): owner, ordinal, kind and signature (a
     /// `FnPtr` of `t` in the owner's parameters), as the owner's check records them.
     pub closures: Vec<(ItemKey, u32, crate::ty::ClosureKind, PTy)>,
@@ -181,6 +183,7 @@ impl Fx {
             next: 0x5157_0000,
             names: Vec::new(),
             opaques: Vec::new(),
+            adt_clauses: Vec::new(),
             closures: Vec::new(),
             hidden: Vec::new(),
             coroutines: Vec::new(),
@@ -287,6 +290,11 @@ impl Fx {
         let k = self.key(name);
         self.opaques.push((k, Vec::new()));
         k
+    }
+
+    /// ADT `k`'s where-clauses over its generics (`struct S<O, F: Tr<O>>`): its `predicates`.
+    pub fn set_adt_clauses(&mut self, k: ItemKey, clauses: Vec<PClause>) {
+        self.adt_clauses.push((k, clauses));
     }
 
     /// The bounds of opaque `k`, each with `Self` the opaque type over the generics in scope.
@@ -939,6 +947,8 @@ impl World for Fx {
             &i.clauses
         } else if let Some((_, o)) = self.opaques.iter().find(|(k, _)| *k == item) {
             o
+        } else if let Some((_, c)) = self.adt_clauses.iter().find(|(k, _)| *k == item) {
+            c
         } else {
             &[]
         };

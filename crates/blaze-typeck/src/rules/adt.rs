@@ -434,6 +434,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             f.a = 0;
             match self.struct_path(At::Expr(e), path)? {
                 Some((k, variant, args)) => {
+                    // The struct's where-clauses at its arguments, as a ctor's (rustc: the
+                    // struct path's required obligations): `S { f: Some(finish), .. }` for
+                    // `struct S<O, F: FnOnce(Option<O>)>` decides `O` by the bound only.
+                    self.register_predicates(k, args, crate::ty::Cause::Expr(e))?;
                     let adt_ty = self.mk(TyView::Adt(k, args))?;
                     if let Some(hint) = f.expect.only_has_type() {
                         self.commit_if(|m| -> Result<Option<()>, Stop> {

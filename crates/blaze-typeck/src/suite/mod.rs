@@ -49,6 +49,7 @@ mod const_path_args;
 mod const_terms;
 mod coroutine;
 mod coroutine_id;
+mod ctor_adt_clauses;
 mod deferred_place;
 mod discriminant;
 mod dyn_objects;

@@ -738,6 +738,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 // `E::V::<T>`): the last segment that has them.
                 let written = segs.iter().rev().find(|s| s.has_args).copied();
                 let args = self.explicit_args(at, written, adt, 0, info.generics)?;
+                // A ctor's predicates are its ADT's (rustc `predicates_of(ctor)` is the
+                // parent's; `instantiate_value_path` registers them). e9 everything-edge
+                // request_span.rs: `Unrun(Some(finish), PhantomData)` for `struct Unrun<O, F:
+                // FnOnce(Option<O>)>` decides `O` by that bound only (E0282 without it).
+                if !matches!(kind, CtorKind::Braces) {
+                    self.register_predicates(adt, args, cause)?;
+                }
                 let vkey = info.variants.get(variant as usize).map(|v| v.key);
                 self.ctor_ty(at, adt, vkey, kind, args, name)
             }
