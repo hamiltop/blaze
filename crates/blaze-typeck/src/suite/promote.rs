@@ -176,3 +176,63 @@ fn shared_autoref_of_unit_variant_is_promoted() {
     assert!(c.diags.is_empty(), "f_cell checks clean: {:?}", c.diags);
     assert!(c.promoted.is_empty(), "a `!Freeze` autoref is never promoted: {:?}", c.promoted);
 }
+
+/// `fn g() -> &'static (&'static <inner>,) { &(&<inner value>,) }`: `cell` makes the inner
+/// value `cell(1)` (a `Cell`, `!Freeze`), else the literal `1u64`. Returns the record and the
+/// outer and inner borrows.
+fn borrow_of_borrow(cell: bool) -> (crate::Checked<'static>, crate::ids::ExprId, crate::ids::ExprId) {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let freeze = fx.tr("Freeze", 1, Vec::new(), &[]);
+    fx.auto(freeze);
+    fx.lang(LangItem::Freeze, freeze);
+    let u64_ = fx.ty(PNode::Uint(UintTy::U64));
+    let p0 = fx.param(0);
+    let uc = fx.strukt("UnsafeCell", 1, &[("value", p0)]);
+    let uc_p0 = fx.adt(uc, &[p0]);
+    let neg = fx.imp("!Freeze for UnsafeCell<T>", 1, uc_p0, Some((freeze, &[])), &[], Vec::new());
+    fx.set_polarity(neg, ImplPolarity::Negative);
+    let uc_u64 = fx.adt(uc, &[u64_]);
+    let cell_s = fx.strukt("Cell", 0, &[("value", uc_u64)]);
+    let cell_ty = fx.adt(cell_s, &[]);
+    let cell_fn = fx.func("cell", 0, &[u64_], cell_ty, Vec::new());
+    fx.set_attrs(cell_fn, TypeAttrs(TypeAttrs::PROMOTABLE));
+    let inner_ty = if cell { cell_ty } else { u64_ };
+    let r_inner = fx.r(Mutbl::Not, inner_ty);
+    let tup = fx.tuple(&[r_inner]);
+    let out = fx.r(Mutbl::Not, tup);
+    let owner = fx.func("g", 0, &[], out, Vec::new());
+    fx.finish();
+    let mut bb = Bb::new();
+    let value = if cell {
+        let path = bb.path(&["cell"]);
+        let one = bb.int(None);
+        bb.call(path, &[one])
+    } else {
+        bb.int(Some(crate::body::IntSuffix::Uint(UintTy::U64)))
+    };
+    let inner = bb.borrow(Mutbl::Not, value);
+    let t = bb.tuple(&[inner]);
+    let outer = bb.borrow(Mutbl::Not, t);
+    let root = bb.block(&[], Some(outer));
+    let c = check_body(&fx, &bb, owner, root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "the body checks clean: {:?}", c.diags);
+    (c, outer, inner)
+}
+
+/// NESTED BORROW: `&(&1u64,)` promotes both borrows. e9 everything-design components.rs
+/// `catalog()` returns `&[Component { variants: &["primary", ..], .. }]`; rustc promote_consts.rs
+/// `validate_ref` takes a shared borrow of a promotable, interior-immutable place as
+/// promotable. Before the rule only the inner borrow was listed, and the outer one was a frame
+/// temporary returned from the fn (E0515). `&(&cell(1),)` lists neither: the inner value is
+/// `!Freeze`.
+#[test]
+fn a_borrow_inside_a_promoted_value_is_promotable() {
+    let (c, outer, inner) = borrow_of_borrow(false);
+    let mut want = std::vec![outer, inner];
+    want.sort_unstable_by_key(|e| e.0);
+    assert_eq!(&c.promoted[..], &want[..], "both borrows of `&(&1u64,)` are promoted");
+    let (c, _, _) = borrow_of_borrow(true);
+    assert!(c.promoted.is_empty(), "a borrow of a `!Freeze` value promotes nothing: {:?}", c.promoted);
+}

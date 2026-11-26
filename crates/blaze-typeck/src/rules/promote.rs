@@ -17,7 +17,8 @@
 //! The rule as decided here, after the walk (the expression tree and the solver are the
 //! checker's): an `Expr::Ref { mutbl: Not, operand }` is listed in `Checked::promoted` when
 //! - its operand is promotable: a literal; a path to a `const`, a fn item or a unit or tuple
-//!   ctor; a tuple, array or struct literal (no `..base`) of promotable operands; a call of a
+//!   ctor; a tuple, array or struct literal (no `..base`) of promotable operands; a shared
+//!   borrow of a promotable operand whose type is `Freeze` with no drop glue; a call of a
 //!   fn item whose attributes carry `#[rustc_promotable]` ([`TypeAttrs::PROMOTABLE`]), or of a
 //!   tuple ctor, with promotable arguments; parentheses around one of these;
 //! - and the operand's type is `Freeze` with no drop glue, decided structurally where the type
@@ -140,6 +141,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 },
                 Expr::Tuple { elems } | Expr::Array { elems } => work.extend_from_slice(self.body.expr_list(elems)?),
                 Expr::Repeat { elem, .. } => work.push(elem),
+                // A shared borrow of a promotable operand whose type is `Freeze` (rustc
+                // promote_consts.rs `validate_ref`: a shared borrow is promotable when the place
+                // has no mutable interior). e9 everything-design components.rs `catalog()`
+                // returns `&[Component { variants: &["primary", ..], .. }]`; with the inner `&`
+                // refused, the outer borrow was a frame temporary (returned-local, E0515).
+                Expr::Ref { mutbl: Mutbl::Not, operand } => {
+                    let Some(&t) = self.expr_ty.get(operand.ix()) else { return Ok(false) };
+                    if !self.freeze_without_drop(t)? {
+                        return Ok(false);
+                    }
+                    work.push(operand);
+                }
                 Expr::Struct { fields, base: crate::body::StructBase::None, .. } => {
                     for f in self.body.field_init_list(fields)? {
                         work.push(f.expr);
