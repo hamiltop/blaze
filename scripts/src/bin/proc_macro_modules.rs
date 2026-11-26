@@ -1715,7 +1715,10 @@ impl Plan<'_> {
         let mut every = vec![Vec::new(); self.args.crates.len()];
         let located: Vec<usize> = self.located().map(|it| it.0).collect();
         for &at in &located {
-            every[at] = feature_names(&self.manifest_of(at)?);
+            // Not `rustc-dep-of-std`: that feature is std's own build of the crate (`rustix`'s
+            // turns on `bitflags/rustc-dep-of-std`, which no registry `bitflags` resolves), so
+            // with it on the pass cannot resolve, and no build here ever asks for it.
+            every[at] = feature_names(&self.manifest_of(at)?).into_iter().filter(|f| f != "rustc-dep-of-std").collect();
         }
         manifest = manifest_with(&every);
         let mut optional = 0;

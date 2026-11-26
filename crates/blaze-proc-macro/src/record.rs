@@ -536,8 +536,9 @@ fn stream_pieces(stream: &TokenStream<'_>, mut out: impl FnMut(&[u8])) {
 /// `CARGO_MANIFEST_DIR` back to virtual mount root in emitted string literals (D60/D96). 5: native
 /// bridge materializes all safe relative files of `Files::Listed` into `$CARGO_MANIFEST_DIR`, not
 /// only `Cargo.toml`. 6: native bridge preserves non-invisible root subtree delimiters
-/// (`Paren`/`Brace`/`Bracket`) in `FlatTree` replies (e.g. `paste::paste! {{ ... }}`).
-pub const HOST_VERSION: u32 = 6;
+/// (`Paren`/`Brace`/`Bracket`) in `FlatTree` replies (e.g. `paste::paste! {{ ... }}`). 7: the sandbox answers a path named from an open
+/// folder's descriptor (it answered `ENOTCAPABLE`: `wit-parser`'s directory walk failed).
+pub const HOST_VERSION: u32 = 7;
 
 /// The base of `call`'s record: computed from text, before the run.
 pub fn base_key(module_wasm_sha256: &str, export: &Exported, edition: Edition, call: &ProcCall<'_>) -> ContentId {

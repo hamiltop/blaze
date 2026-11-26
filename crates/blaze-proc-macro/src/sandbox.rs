@@ -234,6 +234,8 @@ struct Opened {
     pos: u64,
     /// A folder's entries, sorted.
     entries: Option<Vec<(Vec<u8>, Filetype)>>,
+    /// The path it was opened by, from the root: a folder's names its entries from it.
+    folder: Vec<u8>,
 }
 
 /// One run's sandbox.
@@ -433,6 +435,27 @@ impl Sandbox {
         fd.checked_sub(ROOT_FD + 1).and_then(|at| self.files.get_mut(at as usize)).and_then(Option::as_mut)
     }
 
+    /// `path` named from the descriptor `at`, as a path from the root: the root's descriptor
+    /// (wasi-libc passes every absolute path from it) or an open folder's (`wit-parser` and
+    /// std name a `read_dir` entry from its folder's). Any other descriptor is not a folder.
+    fn from(&self, at: u32, path: &[u8]) -> Result<Vec<u8>, Errno> {
+        if at == ROOT_FD {
+            return Ok(path.to_vec());
+        }
+        let opened = at.checked_sub(ROOT_FD + 1).and_then(|at| self.files.get(at as usize)).and_then(Option::as_ref);
+        match opened {
+            Some(Opened { entries: Some(_), folder, .. }) => {
+                let mut joined = Vec::with_capacity(folder.len() + 1 + path.len());
+                joined.extend_from_slice(folder);
+                joined.push(b'/');
+                joined.extend_from_slice(path);
+                Ok(joined)
+            }
+            Some(_) => Err(Errno::NOTDIR),
+            None => Err(Errno::BADF),
+        }
+    }
+
 }
 
 fn filestat(filetype: Filetype, size: u64) -> Filestat {
@@ -532,13 +555,14 @@ impl System for Sandbox {
     }
 
     fn open(&mut self, at: u32, path: &[u8], how: Open) -> Answer<u32> {
-        if at != ROOT_FD {
-            return Ok(Err(Errno::NOTCAPABLE));
-        }
+        let path = match self.from(at, path) {
+            Ok(path) => path,
+            Err(errno) => return Ok(Err(errno)),
+        };
         if how.create() || how.truncate() || how.write() || how.append() {
             return Ok(Err(Errno::ROFS));
         }
-        let rel = self.resolve(path)?;
+        let rel = self.resolve(&path)?;
         let Some(found) = self.found(&rel)? else {
             self.record(format!("file:{rel}"), None);
             return Ok(Err(Errno::NOENT));
@@ -546,7 +570,7 @@ impl System for Sandbox {
         let opened = if let Found::Folder = found {
             let entries = self.package.files.listing(&rel).map_err(|why| self.refuse(why))?;
             self.record(format!("dir:{rel}"), Some(listing_digest(&entries)));
-            Opened { bytes: Vec::new(), pos: 0, entries: Some(entries) }
+            Opened { bytes: Vec::new(), pos: 0, entries: Some(entries), folder: path }
         } else {
             if how.directory() {
                 return Ok(Err(Errno::NOTDIR));
@@ -556,7 +580,7 @@ impl System for Sandbox {
                 return Ok(Err(Errno::IO));
             };
             self.record(format!("file:{rel}"), Some(digest(&bytes)));
-            Opened { bytes, pos: 0, entries: None }
+            Opened { bytes, pos: 0, entries: None, folder: Vec::new() }
         };
         let slot = match self.files.iter().position(Option::is_none) {
             Some(slot) => slot,
@@ -570,10 +594,11 @@ impl System for Sandbox {
     }
 
     fn path_stat(&mut self, at: u32, path: &[u8], _follow: bool) -> Answer<Filestat> {
-        if at != ROOT_FD {
-            return Ok(Err(Errno::NOTCAPABLE));
-        }
-        let rel = self.resolve(path)?;
+        let path = match self.from(at, path) {
+            Ok(path) => path,
+            Err(errno) => return Ok(Err(errno)),
+        };
+        let rel = self.resolve(&path)?;
         if rel.is_empty() {
             return Ok(Ok(filestat(Filetype::Directory, 0)));
         }
@@ -686,5 +711,35 @@ mod seen_tests {
         let Err(stop) = above else { panic!("a path above the workspace was answered") };
         assert!(stop.0.contains("/workspace/../etc/passwd") && stop.0.contains("outside /workspace"), "{}", stop.0);
         assert!(!stop.0.contains(env!("CARGO_MANIFEST_DIR")), "the words hold no path of this machine: {}", stop.0);
+    }
+
+    /// e9 (2026-11-25): `wasmtime::component::bindgen!({ path: "../../wit/everything-auth" })`
+    /// in a workspace member failed, "failed to read directory /workspace/wit/everything-auth
+    /// … Capabilities insufficient": `wit-parser` lists the folder and std opens each entry
+    /// from the folder's descriptor, `path_open(dir fd, "types.wit")`, and the sandbox answered
+    /// every descriptor but the root's `ENOTCAPABLE`. A folder's descriptor names its entries
+    /// from the folder, as the build-script sandbox already does (script_sandbox.rs `from`).
+    /// CONTROLS: a file's descriptor is not a folder (`ENOTDIR`); `..` from a folder still
+    /// cannot leave the tree. Expected line:
+    /// `test sandbox::seen_tests::a_folders_descriptor_names_its_entries ... ok`.
+    #[test]
+    fn a_folders_descriptor_names_its_entries() {
+        use blaze_wasi::{Errno, Filetype, Open, ROOT_FD, System};
+        let root = ScriptRoot::member("src").unwrap_or_else(|e| panic!("{e}"));
+        let member = Package::new(Files::Member { workspace: PathBuf::new(), root }, PackageEnv::default()).unwrap_or_else(|e| panic!("{e}"));
+        let mut sandbox = Sandbox::new(Arc::new(member));
+        let folder = Open { dirflags: 1, oflags: 2, rights_base: 1 << 1, rights_inheriting: 0, fdflags: 0 };
+        let dir = sandbox.open(ROOT_FD, b"workspace/src", folder);
+        let Ok(Ok(dir)) = dir else { panic!("the folder: {:?}, refused {:?}", dir.map_err(|stop| stop.0), sandbox.refused) };
+        let stat = sandbox.path_stat(dir, b"sandbox.rs", true);
+        assert!(matches!(&stat, Ok(Ok(it)) if it.filetype == Filetype::RegularFile), "refused {:?}", sandbox.refused);
+        let file = Open { dirflags: 1, oflags: 0, rights_base: 1 << 1, rights_inheriting: 0, fdflags: 0 };
+        let fd = sandbox.open(dir, b"sandbox.rs", file);
+        let Ok(Ok(fd)) = fd else { panic!("the entry: {:?}, refused {:?}", fd.map_err(|stop| stop.0), sandbox.refused) };
+        let mut head = [0u8; 3];
+        assert!(matches!(sandbox.read(fd, &mut head), Ok(Ok(3))));
+        assert_eq!(&head, b"//!");
+        assert!(matches!(sandbox.open(fd, b"x", file), Ok(Err(Errno::NOTDIR))), "a file's descriptor is no folder");
+        assert!(sandbox.path_stat(dir, b"../../etc", true).is_err(), "`..` from the folder stays in the tree");
     }
 }
