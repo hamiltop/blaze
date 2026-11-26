@@ -509,13 +509,20 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// `&` (`raw` false: a reference) and `&raw` (`raw` true: a raw pointer).
     fn expr_borrow(&mut self, f: Frame, _e: ExprId, mutbl: Mutbl, operand: ExprId, raw: bool) -> Result<Flow, Stop> {
         if f.state == 0 {
-            let hint = match f.expect.to_option() {
+            // rustc: `only_has_type`, then a place operand expects the pointee (a place may be
+            // unsized) and any other operand takes it as `rvalue_hint`, by the STRUCT TAIL. e9
+            // everything-auth mcp_oauth.rs `from_row(&entry?)`: `from_row(&RawValue)`, `entry`
+            // an `Option<Box<RawValue>>`, and `RawValue { json: str }`. As `HasType(RawValue)`
+            // the `?`'s arms coerced `Box<RawValue>` to `RawValue` (E0308); as the hint, the
+            // operand is `Box<RawValue>` and the argument deref-coerces after.
+            let hint = match f.expect.only_has_type() {
                 Some(t) => match self.view(t) {
                     TyView::Ref(_, inner) | TyView::Ptr(_, inner) => {
                         let inner = self.ty.shallow_resolve(inner);
-                        match self.view(inner) {
-                            TyView::Str | TyView::Slice(_) => Expectation::RvalueLikeUnsized(inner),
-                            _ => Expectation::HasType(inner),
+                        if self.is_syntactic_place(operand)? {
+                            Expectation::HasType(inner)
+                        } else {
+                            self.rvalue_hint(inner)?
                         }
                     }
                     _ => Expectation::None,
@@ -583,6 +590,27 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             _ => Ok(Flow::Done(self.common.unit)),
         }
+    }
+
+    /// `is_syntactic_place_expr` with no finding: a local, a field, an index, a deref or a path
+    /// (rustc: a path is a place when it names a local or a static; whichever it names, a path
+    /// is sized, so `&`'s hint is the same). Bounded by the body's expression count.
+    fn is_syntactic_place(&self, e: ExprId) -> Result<bool, Stop> {
+        let mut cur = e;
+        for _ in 0..=self.body.exprs.len() {
+            match self.body.expr(cur)? {
+                Expr::Paren(inner) => cur = inner,
+                Expr::Local(_)
+                | Expr::Field { .. }
+                | Expr::TupleField { .. }
+                | Expr::Index { .. }
+                | Expr::Missing
+                | Expr::Path(_)
+                | Expr::Unary { op: UnOp::Deref, .. } => return Ok(true),
+                _ => return Ok(false),
+            }
+        }
+        Err(crate::error::CheckError::Malformed(crate::error::Malformed::Expr(e)).into())
     }
 
     /// `is_syntactic_place_expr`, else E0070. Bounded by the body's expression count.

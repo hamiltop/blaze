@@ -104,6 +104,7 @@ mod self_ty_paths;
 mod type_alias_paths;
 mod trait_relative_value;
 mod inherent_impl_clauses;
+mod borrow_unsized_tail_hint;
 mod unsized_arg_hint;
 mod deref_open_target;
 mod op_peeled_ref;
