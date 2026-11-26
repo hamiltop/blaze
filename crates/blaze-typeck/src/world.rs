@@ -577,6 +577,10 @@ impl TypeAttrs {
     /// Blaze edition: transparent all-`pub` struct eligible for automatic `Copy`/`Clone`
     /// (`blaze_solve::facts::AdtFlags::AUTO_COPY_PUB`). Bit 12.
     pub const AUTO_COPY_PUB: u32 = 1 << 12;
+    /// `#[rustc_deprecated_safe_2024]` on an `unsafe fn` (`std::env::set_var`, `remove_var`):
+    /// before edition 2024 a call of it is safe, a lint's finding only (rules/unsafety.rs; the
+    /// Edition Guide, "Unsafe `set_var` and `remove_var`"). Bit 13.
+    pub const DEPRECATED_SAFE_2024: u32 = 1 << 13;
 
     /// These attributes with an enum's discriminant type set.
     pub const fn with_discr(self, d: DiscrRepr) -> Self {

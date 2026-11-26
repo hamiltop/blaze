@@ -54,6 +54,10 @@ pub const INTRINSIC: &str = "rustc_intrinsic";
 /// `cfg_attr(target_feature = ..)` also contains the word; the head's lowered qualifiers decide.
 pub const TARGET_FEATURE: &str = "target_feature";
 
+/// The attribute that keeps an `unsafe fn` safe to call before edition 2024
+/// ([`TypeAttrs::DEPRECATED_SAFE_2024`]; library/std/src/env.rs, `set_var` and `remove_var`).
+pub const DEPRECATED_SAFE_2024: &str = "rustc_deprecated_safe_2024";
+
 /// The typing attributes of the fn whose head is `f`, already read while that head was made.
 pub fn fn_type_attrs(f: &FnHead<'_>) -> TypeAttrs {
     f.qualifiers.typing()

@@ -282,11 +282,15 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             return Ok(());
         }
         let Some(sig) = self.reads.fn_sig(k)? else { return Ok(()) };
+        let attrs = self.reads.attrs(k)?;
         if sig.header.safety == Safety::Unsafe {
-            self.refuse(ctx, At::Expr(e), UnsafeOp::Call(Some(k)));
+            // `#[rustc_deprecated_safe_2024]`: safe to call before 2024 (`TypeAttrs`).
+            let safe_before_2024 = attrs.0 & crate::TypeAttrs::DEPRECATED_SAFE_2024 != 0;
+            if !(safe_before_2024 && self.body.edition < Edition::E2024) {
+                self.refuse(ctx, At::Expr(e), UnsafeOp::Call(Some(k)));
+            }
             return Ok(());
         }
-        let attrs = self.reads.attrs(k)?;
         match self.feature_gate(attrs, sig.header.safety)? {
             Gate::Open => {}
             Gate::Unsafe => self.refuse(ctx, At::Expr(e), UnsafeOp::TargetFeatureCall(k)),
