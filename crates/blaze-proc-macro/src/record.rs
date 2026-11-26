@@ -537,8 +537,10 @@ fn stream_pieces(stream: &TokenStream<'_>, mut out: impl FnMut(&[u8])) {
 /// bridge materializes all safe relative files of `Files::Listed` into `$CARGO_MANIFEST_DIR`, not
 /// only `Cargo.toml`. 6: native bridge preserves non-invisible root subtree delimiters
 /// (`Paren`/`Brace`/`Bracket`) in `FlatTree` replies (e.g. `paste::paste! {{ ... }}`). 7: the sandbox answers a path named from an open
-/// folder's descriptor (it answered `ENOTCAPABLE`: `wit-parser`'s directory walk failed).
-pub const HOST_VERSION: u32 = 7;
+/// folder's descriptor (it answered `ENOTCAPABLE`: `wit-parser`'s directory walk failed). 8:
+/// `TokenStream::to_string` prints as rustc's pretty-printer does, line breaks included (a macro
+/// hashing it got another fingerprint than its lockfile's).
+pub const HOST_VERSION: u32 = 8;
 
 /// The base of `call`'s record: computed from text, before the run.
 pub fn base_key(module_wasm_sha256: &str, export: &Exported, edition: Edition, call: &ProcCall<'_>) -> ContentId {

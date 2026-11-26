@@ -31,7 +31,7 @@
 
 use core::fmt;
 
-use blaze_expand::{Delim, Edition, LitKind, ProcKind, ProcLevel, Raw, Spacing, TokenKind, TokenOrigin, TokenStream, Transparency, lex};
+use blaze_expand::{Delim, Edition, LitKind, PrettyTok, ProcKind, ProcLevel, Raw, Spacing, TokenKind, TokenOrigin, TokenStream, Transparency, lex, pretty_print};
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::bridge::{Field, Malformed, Reader, Writer, index, len64, wide};
@@ -1018,38 +1018,36 @@ impl<'a> Server<'a> {
         w.set_usize(at, len64(len));
     }
 
-    /// A space between two tokens, but none after a joint `Punct` or an opening delimiter, nor
-    /// before a closing one.
+    /// `toks` as rustc's `TokenStream::to_string` prints them, its line breaks included
+    /// (`blaze_expand::pretty_print`).
     fn print(&self, toks: &[Tok], out: &mut AVec<'_, u8>) {
-        let mut glue = true;
+        // The literals' text first, so the printer's tokens can borrow it.
+        let mut literals: AVec<'_, u8> = Vec::new_in(self.alloc);
+        let mut ends: AVec<'_, usize> = Vec::new_in(self.alloc);
         for tok in toks {
-            let closing = matches!(tok, Tok::Close { .. });
-            if !glue && !closing {
-                out.push(b' ');
-            }
-            glue = false;
-            match *tok {
-                Tok::Open { delim, .. } => {
-                    out.extend_from_slice(open_text(delim).as_bytes());
-                    glue = true;
-                }
-                Tok::Close { delim } => out.extend_from_slice(close_text(delim).as_bytes()),
-                Tok::Ident { sym, raw, .. } => {
-                    if raw {
-                        out.extend_from_slice(b"r#");
-                    }
-                    out.extend_from_slice(self.sym_text(sym).as_bytes());
-                }
-                Tok::Punct { ch, joint, .. } => {
-                    out.push(ch);
-                    glue = joint;
-                }
-                Tok::Literal { kind, sym, suffix, .. } => {
-                    let suffix = suffix.map_or("", |it| self.sym_text(it));
-                    write_literal(out, kind, self.sym_text(sym), suffix);
-                }
+            if let Tok::Literal { kind, sym, suffix, .. } = *tok {
+                let suffix = suffix.map_or("", |it| self.sym_text(it));
+                write_literal(&mut literals, kind, self.sym_text(sym), suffix);
+                ends.push(literals.len());
             }
         }
+        let text = core::str::from_utf8(&literals).unwrap_or("");
+        let mut pretty: AVec<'_, PrettyTok<'_>> = Vec::new_in(self.alloc);
+        let mut next: usize = 0;
+        for tok in toks {
+            pretty.push(match *tok {
+                Tok::Open { delim, .. } => PrettyTok::Open(delim),
+                Tok::Close { delim } => PrettyTok::Close(delim),
+                Tok::Ident { sym, raw, .. } => PrettyTok::Ident { text: self.sym_text(sym), raw },
+                Tok::Punct { ch, joint, .. } => PrettyTok::Punct { ch: char::from(ch), joint },
+                Tok::Literal { .. } => {
+                    let from = next.checked_sub(1).map_or(0, |at| ends[at]);
+                    next += 1;
+                    PrettyTok::Literal { text: text.get(from..ends[next - 1]).unwrap_or("") }
+                }
+            });
+        }
+        pretty_print(&pretty, self.alloc, &mut |piece| out.extend_from_slice(piece.as_bytes()));
     }
 
     /// `emit_diagnostic`: the diagnostic and its children, each kept with its first span.

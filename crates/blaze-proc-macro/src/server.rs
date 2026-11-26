@@ -22,7 +22,7 @@ use std::alloc::Global;
 
 use blaze_expand::{
     Ctx, Delim, Edition, HostError, LitKind, ProcCall, ProcDiagnostic, ProcKind, ProcLevel, ProcLimit, Produced, Raw, Reads,
-    Spacing, Text, TokenKind, TokenOrigin, TokenStream, Transparency, lex,
+    PrettyTok, Spacing, Text, TokenKind, TokenOrigin, TokenStream, Transparency, lex, pretty_print,
 };
 use blaze_own::{AVec, Alloc};
 
@@ -932,49 +932,36 @@ impl Server {
         matches!(stream.tokens(), [token] if matches!(token.kind, TokenKind::Ident { raw: Raw::No, .. }) && stream.text_of(token) == text)
     }
 
-    /// `toks` printed as rustc's `TokenStream::to_string` spaces them: a space between two
-    /// tokens, but none after a joint `Punct`, an opening delimiter, or before a closing one.
+    /// `toks` printed as rustc's `TokenStream::to_string` prints them, its line breaks included
+    /// (`blaze_expand::pretty_print`).
     fn print(&self, toks: &[Tok]) -> String {
-        let mut out = String::new();
-        let mut glue = true;
+        // The literals' text first, so the printer's tokens can borrow it.
+        let mut literals = String::new();
+        let mut ends: Vec<usize, Global> = Vec::new_in(Global);
         for tok in toks {
-            let closing = matches!(tok, Tok::Close { .. });
-            if !glue && !closing {
-                out.push(' ');
-            }
-            glue = false;
-            match *tok {
-                Tok::Open { delim, .. } => {
-                    out.push_str(match delim {
-                        Delim::Paren => "(",
-                        Delim::Brace => "{",
-                        Delim::Bracket => "[",
-                        Delim::Invisible => "",
-                    });
-                    glue = true;
-                }
-                Tok::Close { delim } => out.push_str(match delim {
-                    Delim::Paren => ")",
-                    Delim::Brace => "}",
-                    Delim::Bracket => "]",
-                    Delim::Invisible => "",
-                }),
-                Tok::Ident { sym, raw, .. } => {
-                    if raw {
-                        out.push_str("r#");
-                    }
-                    out.push_str(self.sym_text(sym));
-                }
-                Tok::Punct { ch, joint, .. } => {
-                    out.push(char::from(ch));
-                    glue = joint;
-                }
-                Tok::Literal { kind, sym, suffix, .. } => {
-                    let suffix = suffix.map_or("", |it| self.sym_text(it));
-                    write_literal(&mut out, kind, self.sym_text(sym), suffix);
-                }
+            if let Tok::Literal { kind, sym, suffix, .. } = *tok {
+                let suffix = suffix.map_or("", |it| self.sym_text(it));
+                write_literal(&mut literals, kind, self.sym_text(sym), suffix);
+                ends.push(literals.len());
             }
         }
+        let mut pretty: Vec<PrettyTok<'_>, Global> = Vec::new_in(Global);
+        let mut next: usize = 0;
+        for tok in toks {
+            pretty.push(match *tok {
+                Tok::Open { delim, .. } => PrettyTok::Open(delim),
+                Tok::Close { delim } => PrettyTok::Close(delim),
+                Tok::Ident { sym, raw, .. } => PrettyTok::Ident { text: self.sym_text(sym), raw },
+                Tok::Punct { ch, joint, .. } => PrettyTok::Punct { ch: char::from(ch), joint },
+                Tok::Literal { .. } => {
+                    let from = next.checked_sub(1).map_or(0, |at| ends[at]);
+                    next += 1;
+                    PrettyTok::Literal { text: &literals[from..ends[next - 1]] }
+                }
+            });
+        }
+        let mut out = String::new();
+        pretty_print(&pretty, Global, &mut |piece| out.push_str(piece));
         out
     }
 
