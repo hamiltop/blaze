@@ -118,6 +118,14 @@ pub trait Owner {
     /// slot, so `body: 'r` asks `ρ_P: 'r` through this (rustc: a closure's outlives
     /// components are its upvar types).
     fn body_params(&self, body: PTy) -> Option<&[u32]>;
+    /// Whether the associated type `trait_::name` declares `: 'static` among its own bounds
+    /// (`trait AsContext { type Data: 'static; }`): every projection of it outlives every
+    /// region, whatever its arguments hold (the Reference, "Trait and lifetime bounds"; rustc
+    /// `projection_must_outlive` reads the item bounds before the components rule).
+    fn alias_static(&self, trait_: ItemKey, name: blaze_typeck::Name) -> bool {
+        let _ = (trait_, name);
+        false
+    }
 }
 
 /// What the call rule reads and where it writes.
@@ -1375,6 +1383,9 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         self.outlives(cur.ty, Reg::Origin(rho), region)?;
                         continue;
                     }
+                    // Its item bound `: 'static` proves `cur: 'r` for any `'r`, its arguments
+                    // unasked (rustc `projection_must_outlive`: a trait-declared bound).
+                    PNode::Alias { trait_, name, .. } if self.owner.alias_static(trait_, name) => continue,
                     PNode::Alias { trait_, name, .. } => {
                         let selected: &'c dyn Selected = self.selected;
                         let key = Keyer { walk: &*self, at: AskAt::Kids(cur), budget: Cell::new(MOST_WALK_STEPS) };

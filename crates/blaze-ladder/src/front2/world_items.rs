@@ -886,6 +886,12 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
         if let Some(a) = self.store.adts.get(&item) {
             return Ok(Some(tc::Adt { kind: a.kind, generics: a.generics, variants: &a.variants, fields: &a.fields, types: self.types() }));
         }
+        // Made without its fields while one of its own inherent constants is evaluated
+        // (heads.rs `ProvisionalAdt`): noted, so this check files no read list.
+        if let Some(p) = self.store.provisional_adt(item) {
+            self.store.note_provisional_read(item);
+            return Ok(Some(tc::Adt { kind: p.kind, generics: p.generics, variants: &p.variants, fields: &[], types: self.types() }));
+        }
         match self.detail(item) {
             Some(ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union) => self.want(item),
             _ => Ok(None),

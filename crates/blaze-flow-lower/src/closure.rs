@@ -107,9 +107,14 @@ pub enum External {
     /// The environment's own reference (`&'env self` of an `Fn`/`FnMut`, and the reference an
     /// `FnMut` reaches a `&mut` capture through): bound per call, no position of the value.
     Env,
-    /// For an async block (coroutine.rs `LoweredAsync::externals`), a position of its output:
-    /// the future's type holds no position for it (see [`requirement`]).
+    /// For an `async fn`'s root block (coroutine.rs `async_fn_root`), a position of its output:
+    /// the signature's, never read as a requirement (see [`requirement`]).
     Sig,
+    /// For an async block (coroutine.rs `LoweredAsync::externals`), position `k` of its output
+    /// (`Lower::npos` of the block's `Output`). The future's type holds no position for it, so a
+    /// requirement naming it ([`Need::Output`]) is proven where the output gets one: an `.await`
+    /// of the block, or its unsizing to `dyn Future<Output = T>` (the positions of `T`).
+    Output(u32),
     /// Signature position `k` the OWNER binds ([`SigSlot::Owner`]): position `k` of the
     /// closure value after its captures' (`Lower::npos` of the closure type), so a relation the
     /// body needs on it is the owner's to prove ([`Need::Sig`]).
@@ -166,6 +171,9 @@ pub enum Need {
     Param(u32),
     /// Canonical higher-ranked `dyn for<..>` placeholder `ordinal` ([`External::DynPlaceholder`]).
     DynPlaceholder(u32),
+    /// Position `k` of an async block's output ([`External::Output`]): not proven at the block
+    /// expression (the value holds no position for it) but where the output is given one.
+    Output(u32),
 }
 
 impl Need {
@@ -191,8 +199,8 @@ pub struct Requirement {
 /// The requirement an outlives result of the closure's flow (`UnprovenOutlives { from, into }`:
 /// `from: into` needed between two placeholders, not known) puts on its owner, or `None` when it
 /// cannot be stated there: an end is the environment's reference (bound per call), a universal
-/// signature region ([`External::Late`]: the body must hold for every choice of it), an async
-/// block's output ([`External::Sig`]), or a placeholder this flow did not name. `None` stays
+/// signature region ([`External::Late`]: the body must hold for every choice of it), an `async
+/// fn` root block's output ([`External::Sig`]), or a placeholder this flow did not name. `None` stays
 /// `NestedOutlives`: not checked, never accepted.
 pub fn requirement(externals: &[(blaze_flow::Origin, External)], from: blaze_flow::Origin, into: blaze_flow::Origin) -> Option<Requirement> {
     let end = |o: blaze_flow::Origin| match externals.iter().find(|(x, _)| *x == o).map(|&(_, w)| w) {
@@ -202,6 +210,7 @@ pub fn requirement(externals: &[(blaze_flow::Origin, External)], from: blaze_flo
         Some(External::OwnerParam(i)) => Some(Need::OwnerParam(i)),
         Some(External::Param(u)) => Some(Need::Param(u)),
         Some(External::DynPlaceholder(ord)) => Some(Need::DynPlaceholder(ord)),
+        Some(External::Output(k)) => Some(Need::Output(k)),
         Some(External::Env | External::Sig | External::Late) | None => None,
     };
     Some(Requirement { from: end(from)?, into: end(into)? })
@@ -840,14 +849,42 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         use blaze_borrow::RegionTypes;
         use blaze_typeck::Def;
 
-        let unwrap_parens = |mut cur: ExprId| -> ExprId {
-            for _ in 0..16 {
+        // Whether `cur` evaluates to closure `ce` as its value: the closure itself, in
+        // parentheses, as the tail of a block or an inline constant, or as either arm of an
+        // `if` (std's `thread_local!` writes `LocalKey::new(const { if needs_drop::<T>() {
+        // |init| .. } else { |init| .. } })`). Each such value is coerced at the site that
+        // receives `cur` (the Reference, "Block expressions", "if expressions").
+        let reaches = |start: ExprId| -> bool {
+            let mut todo = [start; 16];
+            let mut n = 1usize;
+            let mut steps = 0u32;
+            while let Some(top) = n.checked_sub(1) {
+                n = top;
+                steps += 1;
+                if steps > 64 {
+                    return false;
+                }
+                let Some(&cur) = todo.get(top) else { return false };
+                if cur == ce {
+                    return true;
+                }
+                let mut push = |x: ExprId| {
+                    if let Some(slot) = todo.get_mut(n) {
+                        *slot = x;
+                        n += 1;
+                    }
+                };
                 match self.body.exprs.get(cur.ix()) {
-                    Some(&Expr::Paren(inner)) => cur = inner,
-                    _ => break,
+                    Some(&Expr::Paren(inner)) => push(inner),
+                    Some(&Expr::Block { tail: Some(inner), .. } | &Expr::ConstBlock { tail: Some(inner), .. }) => push(inner),
+                    Some(&Expr::If { then, else_: Some(els), .. }) => {
+                        push(then);
+                        push(els);
+                    }
+                    _ => {}
                 }
             }
-            cur
+            false
         };
 
         let facts: &'b F = self.facts;
@@ -857,7 +894,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             match *expr {
                 Expr::Struct { fields, .. } => {
                     let Some(fs) = self.body.field_inits.get(fields.range()) else { continue };
-                    let Some(f) = fs.iter().find(|f| unwrap_parens(f.expr) == ce) else { continue };
+                    let Some(f) = fs.iter().find(|f| reaches(f.expr)) else { continue };
                     let (adt, variant) = match self.expr_def(pe) {
                         Some(Def::Ctor { adt, variant, .. }) => (adt, variant),
                         Some(Def::Adt(adt)) if self.facts.adt(adt).is_some_and(|a| !a.is_enum) => (adt, 0),
@@ -871,7 +908,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 }
                 Expr::Call { callee, args } => {
                     let Some(es) = self.body.expr_lists.get(args.range()) else { continue };
-                    let Some(arg_i) = es.iter().position(|&a| unwrap_parens(a) == ce) else { continue };
+                    let Some(arg_i) = es.iter().position(|&a| reaches(a)) else { continue };
                     match self.expr_def(callee) {
                         Some(Def::Ctor { adt, variant, .. }) => {
                             if let Ok(col) = facts.regions().field(adt, variant, to_u32(arg_i)) {
@@ -894,7 +931,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 }
                 Expr::MethodCall { args, .. } => {
                     let Some(es) = self.body.expr_lists.get(args.range()) else { continue };
-                    let Some(arg_i) = es.iter().position(|&a| unwrap_parens(a) == ce) else { continue };
+                    let Some(arg_i) = es.iter().position(|&a| reaches(a)) else { continue };
                     let param_i = to_u32(arg_i + 1);
                     if let Some(pos) = self.ck.callees.column::<0>().iter().position(|&x| x == pe)
                         && let Some(&item) = self.ck.callees.column::<1>().get(pos)
@@ -1284,6 +1321,110 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let Some(&from) = self.ck.closures.column::<4>().get(row) else { return self.refuse(Form::Malformed, e) };
         let SigFrom::Clause { expr, .. } = from else { return Ok(false) };
         Ok(expr == e || matches!(self.body.exprs.get(e.ix()), Some(Expr::Call { callee, .. }) if *callee == expr))
+    }
+
+    /// Whether inline constant `e` (`const { .. }`) is a closure as its value: its tail, through
+    /// parentheses, blocks without statements and both arms of an `if`, is a closure at every
+    /// end (std's `thread_local!`: `const { if needs_drop::<T>() { |init| .. } else { |init| ..
+    /// } }`). Such a constant is walked as the body's own code (its tail evaluated where it
+    /// stands): it captures nothing, and a closure's requirements on its signature then reach
+    /// the site that receives it (`closure_fn_ptr_sig`) instead of being lost in a value
+    /// the walk does not open.
+    pub(crate) fn const_closure_tail(&self, e: ExprId) -> bool {
+        let Some(&Expr::ConstBlock { stmts, tail: Some(t), .. }) = self.body.exprs.get(e.ix()) else { return false };
+        if stmts.len != 0 {
+            return false;
+        }
+        let mut todo = [t; 16];
+        let mut n = 1usize;
+        let mut leaves = 0u32;
+        let mut steps = 0u32;
+        while let Some(top) = n.checked_sub(1) {
+            n = top;
+            steps += 1;
+            if steps > 64 {
+                return false;
+            }
+            let Some(&cur) = todo.get(top) else { return false };
+            let mut push = |x: ExprId| match todo.get_mut(n) {
+                Some(slot) => {
+                    *slot = x;
+                    n += 1;
+                    true
+                }
+                None => false,
+            };
+            let ok = match self.body.exprs.get(cur.ix()) {
+                Some(&Expr::Closure { .. }) => {
+                    leaves += 1;
+                    true
+                }
+                Some(&Expr::Paren(inner)) => push(inner),
+                Some(&Expr::Block { stmts, tail: Some(inner), .. }) if stmts.len == 0 => push(inner),
+                Some(&Expr::If { then, else_: Some(els), .. }) => push(then) && push(els),
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        leaves > 0
+    }
+
+    /// A closure value at `cp` (type `t`) coerced to the fn pointer at `fp`
+    /// (`AdjustKind::ClosureFnPointer`) whose signature the expecting fn pointer laid
+    /// (`SigFrom::FnPtr` with `fn_ptr_expectation` read: its binder's regions are `Late`, its
+    /// written `'static` is `Static`, every other position, a region of the expecting site or
+    /// one under a type parameter's instance, the owner's). The pointer holds the closure's
+    /// call, so each owner signature position IS the pointer's position at the same place:
+    /// related both ways (and a `Static` one with `'static`), as a direct call relates them
+    /// (`closure_call_sig`). `Ok(false)` (nothing related) when the signature was laid any
+    /// other way, the value or pointer is not laid exactly, or the counts part: the caller
+    /// then refuses a body needing a relation on an owner position (`closure_sig_kept`).
+    pub(crate) fn closure_fn_ptr_sig(&mut self, t: PTy, cp: Place, fp: Place, e: ExprId) -> Result<bool, Refusal> {
+        let PNode::Closure { owner, ordinal, .. } = self.node(t, e)? else { return Ok(false) };
+        if owner != self.body.owner || !R::RELATES {
+            return Ok(false);
+        }
+        let row = to_usize(ordinal);
+        let ck: &'c Checked<'c> = self.ck;
+        let (Some(&sig), Some(&from), Some(&ce)) = (ck.closures.column::<2>().get(row), ck.closures.column::<4>().get(row), ck.closures.column::<0>().get(row)) else {
+            return Ok(false);
+        };
+        if from != SigFrom::FnPtr {
+            return Ok(false);
+        }
+        let n_inputs = match self.node(sig, e)? {
+            PNode::FnPtr(l, _) => self.list(l, e)?.len().saturating_sub(1),
+            _ => return Ok(false),
+        };
+        let facts: &'b F = self.facts;
+        let arity = crate::one_call::FactsArity { facts };
+        let heads = blaze_borrow::Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
+        if self.fn_ptr_expectation(ce, n_inputs, &heads, e).is_none() {
+            return Ok(false);
+        }
+        let mut slots: Vec<SigSlot, A> = Vec::new_in(self.alloc);
+        self.sig_slots(row, e, &mut slots)?;
+        let nsig = to_u32(slots.iter().filter(|s| matches!(s, SigSlot::Owner(_))).count());
+        let ci = self.info(cp);
+        let fi = self.info(fp);
+        if !ci.exact || ci.len != nsig || !fi.exact || to_usize(fi.len) != slots.len() {
+            return Ok(false);
+        }
+        // The owner positions are the value's last (`closure_value`).
+        let base = ci.start + ci.len - nsig;
+        for (j, &slot) in slots.iter().enumerate() {
+            let target = match slot {
+                SigSlot::Owner(k) => self.origs[to_usize(base + k)],
+                SigSlot::Static => self.universal(Region::Static),
+                SigSlot::Late(_) | SigSlot::InnerBound(..) => continue,
+            };
+            let here = self.origs[to_usize(fi.start + to_u32(j))];
+            self.b.subset(here, target);
+            self.b.subset(target, here);
+        }
+        Ok(true)
     }
 
     /// A DIRECT call of the closure value laid at `cp` (`t` its type; its first `skip`

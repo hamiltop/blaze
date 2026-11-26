@@ -372,11 +372,23 @@ pub fn macro_path<N: Name, W: World<N>>(world: &W, module: ItemKey, written: Wri
 /// imports, the traits its globs reach (each glob source once), and the standard prelude's;
 /// sorted, without repeats.
 pub fn traits_in_scope<'a, N: Name, W: World<N>>(world: &W, module: ItemKey, alloc: Alloc<'a>) -> Result<AVec<'a, ItemKey>, PathError> {
+    traits_reached(world, module, true, alloc)
+}
+
+/// The traits a glob `use <module>::*;` brings: [`traits_in_scope`] without `module`'s
+/// prelude. A glob imports a module's names, never the standard prelude its crate's edition
+/// gives it (the Reference, `names.preludes.std`: the prelude is a scope of its own, not
+/// items of each module), as this module's own glob edges are read below.
+pub fn glob_traits<'a, N: Name, W: World<N>>(world: &W, module: ItemKey, alloc: Alloc<'a>) -> Result<AVec<'a, ItemKey>, PathError> {
+    traits_reached(world, module, false, alloc)
+}
+
+fn traits_reached<'a, N: Name, W: World<N>>(world: &W, module: ItemKey, prelude: bool, alloc: Alloc<'a>) -> Result<AVec<'a, ItemKey>, PathError> {
     let mut out: AVec<'a, ItemKey> = AVec::new_in(alloc);
     let mut seen: AVec<'a, ItemKey> = AVec::new_in(alloc);
     let mut stack: AVec<'a, ItemKey> = AVec::new_in(alloc);
     stack.push(module);
-    if !world.no_implicit_prelude(module) {
+    if prelude && !world.no_implicit_prelude(module) {
         if let Some(prelude) = world.root_of(module).and_then(|r| r.head().prelude) {
             stack.push(prelude);
         }

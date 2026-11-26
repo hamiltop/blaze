@@ -2398,6 +2398,27 @@ pub struct ProvisionalImpl {
     pub waiting_const: LibKey,
 }
 
+/// An ADT whose field types wait on one of its own inherent constants while that constant is
+/// being evaluated: regalloc2's `struct PRegSet { bits: [Bits; Self::LEN] }` with `const LEN:
+/// usize = (PReg::NUM_INDEX + Self::BITS - 1) / Self::BITS`. Checking `LEN`'s body reads the
+/// path `Self::BITS`, whose prefix the checker reads as the ADT (its kind and generics: is
+/// `BITS` a variant?), which made the whole row, whose field needs `LEN`: refused as a cycle.
+/// The Reference, "Constant evaluation", refuses only a constant that needs ITSELF; rustc keeps
+/// an ADT's variants apart from its fields' types.
+///
+/// So the row is made without its fields (every variant's field list empty) and kept here,
+/// never in [`Store::adts`] (never frozen or encoded), visible to a body check only while
+/// `waiting_const` is on `active_consts`, as a [`ProvisionalImpl`] is. A check that reads it is
+/// noted (`provisional_used`) and files no read list; the constant evaluator's own reads
+/// (layout, `consts.rs` `adt`) never see it, so `size_of::<Self>()` in such a constant is still
+/// refused. Removed when the constant finishes.
+pub struct ProvisionalAdt {
+    pub kind: tc::AdtKind,
+    pub generics: u32,
+    pub variants: Vec<tc::Variant, Global>,
+    pub waiting_const: LibKey,
+}
+
 /// A queued `where const { COND }` evaluation request captured by `BodyWorld::const_holds`
 /// while holding only `&Store`, drained by `check::eval_where_const` between check rounds.
 pub struct PendingConstHolds {
@@ -2434,6 +2455,9 @@ pub struct Store<'n> {
     /// constant ([`ProvisionalImpl`]). Visible only while that impl's `waiting_const` is on
     /// `active_consts` (currently being evaluated).
     pub provisional_impls: Rows<ItemKey, ProvisionalImpl>,
+    /// ADT rows made without their fields while one of their own inherent constants is
+    /// evaluated ([`ProvisionalAdt`]).
+    pub provisional_adts: Rows<ItemKey, ProvisionalAdt>,
     /// Provisional impl keys read during the current body check or projection normalization
     /// (`BodyWorld::impl_header_once`, `BodyWorld::assoc_item_once`).
     pub(super) provisional_used: core::cell::RefCell<blaze_own::Vec<ItemKey, Alloc<'static>>>,
@@ -2963,6 +2987,7 @@ impl<'n> Store<'n> {
             field_defaults: Rows::new_in(alloc),
             impls: Rows::new_in(alloc),
             provisional_impls: Rows::new_in(alloc),
+            provisional_adts: Rows::new_in(alloc),
             provisional_used: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)),
             active_consts: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)),
             fns: Rows::new_in(alloc),
@@ -3038,6 +3063,7 @@ impl<'n> Store<'n> {
             field_defaults,
             impls,
             provisional_impls,
+            provisional_adts,
             provisional_used,
             active_consts,
             fns,
@@ -3101,6 +3127,7 @@ impl<'n> Store<'n> {
         field_defaults.clear();
         impls.clear();
         provisional_impls.clear();
+        provisional_adts.clear();
         provisional_used.get_mut().clear();
         active_consts.get_mut().clear();
         fns.clear();
@@ -5177,7 +5204,25 @@ impl<'n> Store<'n> {
             let start = fields.len() as u32;
             for (j, &n) in v.rows(rows)?.iter().enumerate() {
                 let f = lf::Field::decode(n)?;
-                let ty = b.ty(&mut self.tys, &env, v, f.ty)?;
+                let ty = match b.ty(&mut self.tys, &env, v, f.ty) {
+                    Ok(ty) => ty,
+                    Err(why @ Why::ConstPath(..)) => {
+                        // A field naming an inherent constant of this very ADT while that
+                        // constant is evaluated ([`ProvisionalAdt`]): the row without fields,
+                        // for that evaluation; this head is made again once it is answered.
+                        let running = super::const_inherent::running_sibling(&self.maps.inherents, ck, &|_| true);
+                        let Some(need) = running.filter(|n| self.active_consts.borrow().iter().any(|k| k == n)) else { return Err(why) };
+                        let mut pv = Vec::with_capacity_in(shapes.len(), Global);
+                        pv.extend(shapes.iter().map(|&(vk, name, ctor, _)| tc::Variant { key: vk, name, ctor, fields: List { start: 0, len: 0 } }));
+                        self.provisional_adts.insert(ck, ProvisionalAdt { kind, generics, variants: pv, waiting_const: need });
+                        let r = match why {
+                            Why::ConstPath(_, r) => r,
+                            _ => Range::new(0, 0),
+                        };
+                        return Err(Why::NeedConst(need, r));
+                    }
+                    Err(why) => return Err(why),
+                };
                 field_at.push(hreg::FieldAt { variant: vi as u32, field: j as u32, written: f.ty, ty });
                 let fname = match f.name {
                     Some(n) => Name(v.name(n)?),
@@ -5420,6 +5465,7 @@ impl<'n> Store<'n> {
     /// Removes any provisional impl waiting on constant `need` now that `need` has been
     /// answered (or refused). Returns whether any entry was removed.
     pub(super) fn clear_provisional_for(&self, need: LibKey) -> bool {
+        self.clear_provisional_adts(Some(need));
         if self.provisional_impls.is_empty() {
             return false;
         }
@@ -5438,6 +5484,7 @@ impl<'n> Store<'n> {
     /// Removes every provisional impl entry (called when constant evaluation returns to
     /// depth 0 so no provisional state can outlive an evaluation).
     pub(super) fn clear_all_provisional(&self) -> bool {
+        self.clear_provisional_adts(None);
         if self.provisional_impls.is_empty() {
             return false;
         }
@@ -5449,6 +5496,29 @@ impl<'n> Store<'n> {
             self.provisional_impls.remove(&ck);
         }
         !drop_keys.is_empty()
+    }
+
+    /// Removes the provisional ADT rows ([`ProvisionalAdt`]) waiting on `need`, or all of them.
+    fn clear_provisional_adts(&self, need: Option<LibKey>) {
+        if self.provisional_adts.is_empty() {
+            return;
+        }
+        let mut drop_keys: blaze_own::Vec<ItemKey, Alloc<'static>> = blaze_own::Vec::new_in(self.tys.alloc());
+        for (&ck, p) in self.provisional_adts.iter() {
+            if need.is_none_or(|n| p.waiting_const == n) {
+                drop_keys.push(ck);
+            }
+        }
+        for &ck in drop_keys.iter() {
+            self.provisional_adts.remove(&ck);
+        }
+    }
+
+    /// The provisional row of `ck` ([`ProvisionalAdt`]) while the constant it waits on is
+    /// being evaluated.
+    pub(super) fn provisional_adt(&self, ck: ItemKey) -> Option<&ProvisionalAdt> {
+        let p = self.provisional_adts.get(&ck)?;
+        self.active_consts.borrow().iter().any(|&k| k == p.waiting_const).then_some(p)
     }
 
     fn impl_<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {

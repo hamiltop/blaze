@@ -51,3 +51,19 @@ pub(crate) fn included_read<'a>(package: &str, seen: Option<SeenRoot<'_>>, calli
     }
     included_file(package, seen, calling, reads.subject(read), alloc)
 }
+
+/// The build-script output one `include!` call read (the one file read as text that was
+/// there, under the script's `OUT_DIR`, `out_dir`): its folder is where a `mod x;` at the
+/// included file's top is found (pprof 0.15: `include!(concat!(env!("OUT_DIR"), "/mod.rs"))`,
+/// whose generated `mod.rs` writes `pub mod profile;` beside itself). The calling file stays
+/// the current file of the calls it writes.
+pub(crate) fn included_output<'r>(out_dir: &str, reads: &'r Reads<'_>) -> Option<&'r str> {
+    let mut found = reads.list().iter().filter(|read| read.kind == ReadKind::IncludeStr && matches!(read.answer, ReadAnswer::Digest(_)));
+    let read = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let path = reads.subject(read);
+    path.strip_prefix(out_dir)?.strip_prefix('/')?;
+    Some(path)
+}

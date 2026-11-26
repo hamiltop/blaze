@@ -6,7 +6,7 @@
 //! (D96: a member sees `/workspace/<dir>`), and one outside its own package is flagged (a
 //! warning finding at the call, blaze-cli names/include_outside.rs); a DEPENDENCY's include
 //! stays inside its own package; a path leaving the workspace root, or absolute and not under
-//! the crate's own seen root, is `None`: the host answers `Included::Outside` and the expansion
+//! the root the crate sees, is `None`: the host answers `Included::Outside` and the expansion
 //! refuses it by its path and the rule (`IncludeFailure::Outside`: "the path leaves the unit's
 //! source root: decision D60").
 //!
@@ -50,6 +50,10 @@ fn a_member_reads_a_sibling_directory_by_its_workspace_path() {
     assert_eq!(at(MEMBER, member(), CALLING, "../../tests/assets/x.json"), Some(("/0/crates/precompiles/tests/assets/x.json".into(), false)));
     // `CARGO_MANIFEST_DIR` (D96 (4)): the member's own seen root, absolute, is its package.
     assert_eq!(at(MEMBER, member(), CALLING, "/workspace/crates/precompiles/data/a.bin"), Some(("/0/crates/precompiles/data/a.bin".into(), false)));
+    // Absolute from the workspace root it sees and outside its own package (wasmtime's
+    // `bindgen!` writes `include_bytes!` of each WIT file it read, absolute from
+    // `CARGO_MANIFEST_DIR`): the file the relative `../..` spelling names, read and flagged.
+    assert_eq!(at(MEMBER, member(), CALLING, "/workspace/crates/nitro-attestation/testdata/a.b64"), Some(("/0/crates/nitro-attestation/testdata/a.b64".into(), true)));
     // The workspace's root package (`dir` empty): its package is the workspace root.
     let root = Some(SeenRoot::member("").unwrap_or_else(|e| panic!("{e}")));
     assert_eq!(at("/0", root, "/0/src/lib.rs", "../data/a.json"), Some(("/0/data/a.json".into(), false)));
@@ -70,14 +74,12 @@ fn a_dependency_reads_only_inside_its_package() {
     assert_eq!(at(dep, None, calling, SIBLING), None);
 }
 
-/// (c) A member's path leaving the workspace root, or absolute and not under its own seen root
-/// (the machine's `/etc/..`, another member's `/workspace/..` path), is `None`: refused by
-/// name, never read.
+/// (c) A member's path leaving the workspace root, or absolute and not under the workspace
+/// root it sees (the machine's `/etc/..`), is `None`: refused by name, never read.
 ///
 /// Prints nothing; passes as `tests::include_roots::a_member_path_leaving_the_workspace_or_absolute_is_refused ... ok`.
 #[test]
 fn a_member_path_leaving_the_workspace_or_absolute_is_refused() {
     assert_eq!(at(MEMBER, member(), CALLING, "../../../../../outside.txt"), None, "leaves the workspace root");
     assert_eq!(at(MEMBER, member(), CALLING, "/etc/passwd"), None, "absolute: the machine's");
-    assert_eq!(at(MEMBER, member(), CALLING, "/workspace/crates/nitro-attestation/testdata/a.b64"), None, "absolute: another member's");
 }

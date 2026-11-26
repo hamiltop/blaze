@@ -602,6 +602,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
                 copy_memo: &self.copy_memo,
                 drop_memo: &self.drop_memo,
                 closures: ClosureDrop::ByValueCaptures { owner: self.body.owner, ck: self.ck },
+                no_drop: &self.ck.no_drop,
                 alloc: self.alloc,
             },
             root,

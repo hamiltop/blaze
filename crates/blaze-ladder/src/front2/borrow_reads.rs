@@ -514,6 +514,18 @@ pub fn clauses_read(item: u128, regions: &dyn blaze_flow_lower::RegionFacts) -> 
 }
 
 /// The detail of a [`FactKind::BorrowHead`] row holding whether an associated type item's own
+/// bounds include `: 'static` (borrows.rs `alias_static`).
+pub const ASSOC_STATIC_DETAIL: u64 = 13;
+const ASSOC_STATIC_DOMAIN: &str = "blaze-ladder front2 borrow assoc static v1";
+
+/// One [`ASSOC_STATIC_DETAIL`] row: whether `assoc_item` declares `: 'static`.
+pub fn assoc_static_read(assoc_item: u128, is_static: bool) -> Read {
+    let mut h = StableHasher::new(ASSOC_STATIC_DOMAIN);
+    flag(&mut h, is_static);
+    Read { fact: Fact { kind: FactKind::BorrowHead, key: assoc_item, detail: ASSOC_STATIC_DETAIL }, answer: Some(h.finish()) }
+}
+
+/// The detail of a [`FactKind::BorrowHead`] row holding whether an associated type item's own
 /// bounds include `Copy` (directly or via supertraits).
 pub const ASSOC_COPY_DETAIL: u64 = 12;
 const ASSOC_COPY_DOMAIN: &str = "blaze-ladder front2 borrow assoc copy v1";

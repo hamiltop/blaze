@@ -211,6 +211,14 @@ pub struct Checked<'a> {
     /// `tmp` (blaze-flow-lower coroutine.rs), so an async block's exact interior holds it. An
     /// `.await` whose future is not wholly known has no row.
     pub awaited: Vec<(ExprId, PTy), Alloc<'a>>,
+    /// Each ADT type of `types` whose ADT's generic drop facts say it may need drop only
+    /// because of what its fields name, but which needs none at these arguments once its
+    /// fields' projections are normalized (`Split<'_, char>`: its `<char as
+    /// Pattern>::Searcher<'_>` field is `CharSearcher<'_>`, which runs no code), sorted;
+    /// read with [`Checked::no_drop_of`]. rustc's dropck and `needs_drop` answer per
+    /// instance (`ty::Ty::needs_drop`, which normalizes); the flow lowering reads this so a
+    /// value of such a type keeps no borrow live to its drop. A type not decided has no row.
+    pub no_drop: Vec<PTy, Alloc<'a>>,
     /// Each projection a callee's signature names at each call, and the impl the check chose
     /// for it (src/selected.rs), sorted by expression, each call's rows in the order its
     /// signature was lowered; read with [`Checked::selected_at`]. The borrow check reads a
@@ -298,6 +306,12 @@ impl<'a> Checked<'a> {
     pub fn awaited_of(&self, e: ExprId) -> Option<PTy> {
         let at = self.awaited.binary_search_by_key(&e, |r| r.0).ok()?;
         Some(self.awaited[at].1)
+    }
+
+    /// Whether the ADT type `t` (a type of `types`) was proven to need no drop at its
+    /// arguments ([`Checked::no_drop`]).
+    pub fn no_drop_of(&self, t: PTy) -> bool {
+        self.no_drop.binary_search_by_key(&t.0, |p| p.0).is_ok()
     }
 
     /// The steps of the why-chain `w` (a finding's [`Diag::why`]), root first; `None` when
@@ -402,6 +416,7 @@ impl<'a> Checked<'a> {
             && self.stalled == other.stalled
             && self.coroutine_witnesses == other.coroutine_witnesses
             && self.awaited == other.awaited
+            && self.no_drop == other.no_drop
             && self.selected == other.selected
             && soa3_eq(&self.fru_fields, &other.fru_fields)
             && soa3_eq(&self.default_fields, &other.default_fields)
@@ -443,6 +458,7 @@ impl<'a> core::fmt::Debug for Checked<'a> {
             .field("stalled", &self.stalled)
             .field("coroutine_witnesses", &self.coroutine_witnesses)
             .field("awaited", &self.awaited)
+            .field("no_drop", &self.no_drop)
             .field("selected", &self.selected)
             .field("fru_fields", &self.fru_fields)
             .field("default_fields", &self.default_fields)

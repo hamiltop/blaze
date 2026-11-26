@@ -50,6 +50,15 @@ pub struct ParamOrigin {
 }
 
 impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
+    /// Whether `node` is a projection whose associated type declares `: 'static`
+    /// ([`Facts::static_assocs`]).
+    pub(crate) fn alias_static(&self, node: PNode) -> bool {
+        match node {
+            PNode::Alias { trait_, name, .. } => self.facts.static_assocs().iter().any(|&(k, n)| k == trait_ && n == name),
+            _ => false,
+        }
+    }
+
     /// The body's type parameters `t` holds (pushed to `params`; unsorted, may repeat), and
     /// whether it holds another type whose lifetimes the lowering does not count as positions:
     /// an alias, an opaque type, a closure, a coroutine, a trait object, an inference variable,
@@ -103,6 +112,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 // type arguments are walked for the caller's parameters and for what has none.
                 // For a projection of the value (`captures` false) it stays unplaced.
                 PNode::Opaque(_, l) if captures => stack.extend_from_slice(self.list(l, e)?),
+                // Its item bound says it outlives `'static` (`Facts::alias_static`): it holds
+                // nothing an outlives bound can fail at, whatever its arguments hold.
+                n @ PNode::Alias { .. } if self.alias_static(n) => {}
                 PNode::Alias { .. }
                 | PNode::Opaque(_, _)
                 | PNode::Dynamic(_)

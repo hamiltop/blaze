@@ -371,3 +371,33 @@ fn a_closure_result_holds_its_capture() {
         }
     }
 }
+
+/// A higher-ranked fn pointer passed twice (the Reference, "Subtyping and Variance": each use
+/// of `p: for<'r> fn(&'r S) -> &'r S` is its own instance of the binder): `fn f(p: fn(&S) ->
+/// &S) { k(p); k(p); }` with `fn k(_: fn(&S) -> &S)` is right (rustc accepts it). One
+/// existential origin for the binder's variable across every use made the two calls' binder
+/// instances one region: a spurious `outlives` finding.
+/// Prints: `fn pointer passed twice: []`.
+#[test]
+fn a_fn_pointer_passed_twice() {
+    let mut owners = None;
+    let w = world_with(|fx, _st, rs, unit| {
+        let l = fx.list(&[rs, rs]);
+        let fp = fx.ty(PNode::FnPtr(l, FnPtrHeader::RUST));
+        let k = fx.func("k", 0, &[fp], unit, no_clauses());
+        owners = Some((fx.func("f", 0, &[fp], unit, no_clauses()), k, fp));
+    });
+    let (f, k, fp) = owners.expect("declared");
+    let head = FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[fp], output: w.unit, slots: &[BOUND1, BOUND1] };
+    let mut b = Bb::new();
+    let pp = b.param("p");
+    let (c1, c2) = (call1(&mut b, "k", pp), call1(&mut b, "k", pp));
+    let (s1, s2) = (b.semi(c1), b.semi(c2));
+    let root = b.block(&[s1, s2], None);
+    let mut facts = Lane::of(&w);
+    facts.wide.add(f, head);
+    facts.wide.add(k, head);
+    let got = findings_laid(&w.fx, &b, f, root, &facts, Plant::None);
+    std::println!("fn pointer passed twice: {got:?}");
+    assert!(got.expect("lowered").is_empty());
+}

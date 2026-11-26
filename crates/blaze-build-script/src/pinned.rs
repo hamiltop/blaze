@@ -428,4 +428,15 @@ pub const TEMPO: &[Known] = &[
         why: "proc_macro/src/lib.rs: Span::byte_range (661), Span::join (716) and Literal::subspan (1584) under the unstable proc_macro_span, which the probe's #![feature] turns on; start/end/line/column (667-689) stable as proc_macro_span_location since 1.88.0",
         needs: PROC_MACRO,
     },
+    // e9 everything 2026-11-25: facet 0.46.5 and facet-core 0.46.5 build.rs (one key: the same
+    // snippet). Read against library/core/src/lib.rs:390-395 and
+    // portable-simd/crates/core_simd/src/vector.rs:108.
+    Known {
+        probe: "facet 0.46.5 and facet-core 0.46.5 (autocfg): `core::simd::Simd` under portable_simd",
+        args: AUTOCFG,
+        snippet: "\n            #![feature(portable_simd)]\n            fn _test() { let _: core::simd::Simd<f32, 4>; }\n            ",
+        accepted: true,
+        why: "core/src/lib.rs:390-395 `pub mod simd` re-exports core_simd::simd::*, #[unstable(feature = \"portable_simd\")], which the probe's #![feature] turns on; core_simd/src/vector.rs:108 `pub struct Simd<T, const N: usize>`; `f32` is a SimdElement and 4 a supported lane count",
+        needs: CORE,
+    },
 ];

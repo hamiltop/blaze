@@ -224,6 +224,9 @@ impl Facts for NestedFacts<'_, '_> {
     fn alias_copy(&self, alias: tc::PTy) -> bool {
         self.facts.alias_copy(alias)
     }
+    fn static_assocs(&self) -> &[(tc::ItemKey, tc::Name)] {
+        self.facts.static_assocs()
+    }
     fn shape(&self, item: tc::ItemKey) -> Option<Shape<'_>> {
         self.facts.shape(item)
     }

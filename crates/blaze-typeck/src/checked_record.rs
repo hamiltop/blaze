@@ -58,7 +58,7 @@ use crate::world::{CtorKind, Def, Needs, Prim, Question, ReadList, Shape};
 /// 06: a type node may be an extern type (`PNode::Foreign`, node tag 30).
 /// 07: structural record schemas/names, union pattern narrowing (`union_pats`), and union
 /// coercion adjustments (`AdjustKind::UnionInject`, `AdjustKind::UnionWiden`).
-pub const CHECKED_RECORD_MAGIC: [u8; 8] = *b"bzchkd07";
+pub const CHECKED_RECORD_MAGIC: [u8; 8] = *b"bzchkd08";
 
 /// The record's columns, in the order the header and the body lay them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +82,7 @@ pub enum Col {
     Promoted,
     CoroutineWitnesses,
     Awaited,
+    NoDrop,
     Selected,
     FruFields,
     DefaultFields,
@@ -97,7 +98,7 @@ pub enum Col {
 }
 
 /// Every column, in layout order.
-pub const COLS: [Col; 31] = [
+pub const COLS: [Col; 32] = [
     Col::TyNodes,
     Col::TyLists,
     Col::TyListRows,
@@ -117,6 +118,7 @@ pub const COLS: [Col; 31] = [
     Col::Promoted,
     Col::CoroutineWitnesses,
     Col::Awaited,
+    Col::NoDrop,
     Col::Selected,
     Col::FruFields,
     Col::DefaultFields,
@@ -162,6 +164,7 @@ impl Col {
             Col::Hidden => 16 + 4,
             Col::CoroutineWitnesses => 4 + 1,
             Col::Awaited => 4 + 4,
+            Col::NoDrop => 4,
             Col::Selected => 4 + 4 + 16 + 9 + 8 + 1 + 25,
             Col::FruFields => 4 + 4 + 4,
             Col::DefaultFields => 4 + 4 + 16,
@@ -196,6 +199,7 @@ impl Col {
             Col::Promoted => "promoted",
             Col::CoroutineWitnesses => "coroutine_witnesses",
             Col::Awaited => "awaited",
+            Col::NoDrop => "no_drop",
             Col::Selected => "selected",
             Col::FruFields => "fru_fields",
             Col::DefaultFields => "default_fields",
@@ -1143,7 +1147,7 @@ fn encode_rows<'b>(c: &Checked<'_>, stalled_proved: bool, alloc: Alloc<'b>) -> R
         Some(q) => core::slice::from_ref(q),
         None => &[],
     };
-    let rows: [usize; 31] = [
+    let rows: [usize; 32] = [
         view.len(),
         view.lists_len(),
         list_rows.len(),
@@ -1163,6 +1167,7 @@ fn encode_rows<'b>(c: &Checked<'_>, stalled_proved: bool, alloc: Alloc<'b>) -> R
         c.promoted.len(),
         c.coroutine_witnesses.len(),
         c.awaited.len(),
+        c.no_drop.len(),
         c.selected.len(),
         c.fru_fields.len(),
         c.default_fields.len(),
@@ -1272,6 +1277,7 @@ fn encode_rows<'b>(c: &Checked<'_>, stalled_proved: bool, alloc: Alloc<'b>) -> R
         p.u32(e.0);
         p.ty(t);
     })?;
+    w.column(Col::NoDrop, c.no_drop.iter(), |p, &t| p.ty(t))?;
     w.column(Col::Selected, c.selected.iter(), |p, s| {
         p.u32(s.expr.0);
         p.u32(s.at);
@@ -1359,8 +1365,8 @@ fn encode_rows<'b>(c: &Checked<'_>, stalled_proved: bool, alloc: Alloc<'b>) -> R
 #[derive(Clone, Copy, Debug)]
 pub struct CheckedRecord<'r> {
     bytes: &'r [u8],
-    rows: [u32; 31],
-    at: [usize; 31],
+    rows: [u32; 32],
+    at: [usize; 32],
 }
 
 impl<'r> CheckedRecord<'r> {
@@ -1379,8 +1385,8 @@ impl<'r> CheckedRecord<'r> {
         if have as usize != COLS.len() {
             return Err(E::Columns { have });
         }
-        let mut rows = [0u32; 31];
-        let mut at = [0usize; 31];
+        let mut rows = [0u32; 32];
+        let mut at = [0usize; 32];
         let mut next = (magic + 4 + 4 * COLS.len()) as u64;
         for col in COLS {
             let n = word(magic + 4 + 4 * col.at())?;
@@ -1701,6 +1707,11 @@ impl<'r> CheckedRecord<'r> {
             awaited.push((e, b.ty(g, u32::MAX)?));
             Ok(())
         })?;
+        let mut no_drop = Vec::with_capacity_in(self.rows(Col::NoDrop) as usize, alloc);
+        self.each(Col::NoDrop, |g| {
+            no_drop.push(b.ty(g, u32::MAX)?);
+            Ok(())
+        })?;
         let mut selected = Vec::with_capacity_in(self.rows(Col::Selected) as usize, alloc);
         self.each(Col::Selected, |g| {
             let expr = ExprId(g.u32()?);
@@ -1773,6 +1784,7 @@ impl<'r> CheckedRecord<'r> {
             stalled: Vec::new_in(alloc),
             coroutine_witnesses,
             awaited,
+            no_drop,
             selected,
             fru_fields,
             default_fields,

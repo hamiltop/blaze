@@ -47,6 +47,9 @@ use crate::world::{AdtKind, CtorKind, Def, TypeAttrs, World};
 /// The most types one `Freeze`-and-no-drop decision visits.
 const MOST_TYPE_STEPS: usize = 1 << 14;
 
+/// The most types one [`Machine::instance_no_drop`] walk visits: past it, not decided.
+const MOST_NO_DROP_STEPS: usize = 1 << 10;
+
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// Lists every promoted borrow of the body in `self.promoted`, sorted by expression (the
     /// module doc). Called in the end sequence after `analyze_futures`, when every type the
@@ -89,6 +92,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         }
                     }
                     Expr::Ref { mutbl: Mutbl::Mut, .. } => {}
+                    // `base[i]` through `Index::index(&base, i)` borrows the base's rvalue with
+                    // no adjustment recorded: `&["a", "b"][..]` is a `&'static [&str]` (rustc
+                    // promotes the receiver borrow). The base is listed; blaze-flow-lower reads
+                    // it only for an overloaded shared index (`index_done`), never `IndexMut`.
+                    Expr::Index { base, .. } => {
+                        if first_adjust.get(base.ix()).copied().flatten().is_none()
+                            && let Some(&ty) = self.expr_ty.get(base.ix())
+                            && self.promotable(base)?
+                            && self.freeze_without_drop(ty)?
+                        {
+                            found.push(base);
+                        }
+                    }
                     _ => {
                         if matches!(
                             first_adjust.get(x.ix()).copied().flatten(),
@@ -187,6 +203,89 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let TyView::FnDef(item, _) = self.view(t) else { return Ok(false) };
         let attrs = self.reads.attrs(item)?;
         Ok(attrs.0 & TypeAttrs::PROMOTABLE != 0)
+    }
+
+    /// Whether dropping a value of the ADT type `t` runs no code at its arguments, with each
+    /// field's projections normalized (rustc's `Ty::needs_drop` normalizes before it answers,
+    /// so `Split<'_, char>` is not dropped though `Split<'_, P>` may be). `Some(true)`: it runs
+    /// none, and some field's declared type names a projection, so an ADT's generic drop
+    /// facts (blaze-ladder borrow_fields.rs, which count a projection field as dropping) may
+    /// say otherwise; `Some(false)`: it runs none, and the generic facts already say so;
+    /// `None`: it may run code, or this walk cannot tell (a parameter, an opaque, a trait
+    /// object, a projection that does not normalize, a type past the step cap). Read only:
+    /// the caller runs it in a probe.
+    pub(crate) fn instance_no_drop(&mut self, t: Ty) -> Result<Option<bool>, Stop> {
+        let Some(drop_trait) = self.lang(LangItem::Drop)? else { return Ok(None) };
+        let manually_drop = self.lang(LangItem::ManuallyDrop)?;
+        let mut work: Vec<Ty, Alloc<'a>> = Vec::new_in(self.alloc);
+        work.push(t);
+        let mut kids: Vec<crate::portable::PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut steps = 0usize;
+        let mut projected = false;
+        while let Some(t) = work.pop() {
+            steps += 1;
+            if steps > MOST_NO_DROP_STEPS {
+                return Ok(None);
+            }
+            let t = self.try_structurally_resolve(t)?;
+            match self.view(t) {
+                TyView::Bool
+                | TyView::Char
+                | TyView::Int(_)
+                | TyView::Uint(_)
+                | TyView::Float(_)
+                | TyView::Str
+                | TyView::Never
+                | TyView::FnDef(..)
+                | TyView::FnPtr(..)
+                | TyView::Ptr(..)
+                | TyView::Ref(..)
+                // The Reference, "Unions": "Union fields are never dropped".
+                | TyView::Union(_) => {}
+                TyView::Tuple(l) | TyView::Record(_, l) => {
+                    for i in 0..self.ty.list_len(l) {
+                        work.push(self.ty.list_get(l, i));
+                    }
+                }
+                TyView::Array(elem, _) | TyView::Slice(elem) | TyView::Pat(elem, _) => work.push(elem),
+                TyView::Adt(k, args) => {
+                    if manually_drop == Some(k) {
+                        continue;
+                    }
+                    // A `Drop` impl applies to every instance (E0366/E0367 refuse a narrower one).
+                    if !self.reads.impls_of(drop_trait, crate::world::Shape::Adt(k))?.is_empty() {
+                        return Ok(None);
+                    }
+                    let Some(adt) = self.reads.adt(k)? else { return Ok(None) };
+                    if adt.kind == AdtKind::Union {
+                        continue;
+                    }
+                    for f in adt.fields.iter() {
+                        if !projected {
+                            kids.clear();
+                            kids.push(f.ty);
+                            let mut seen = 0usize;
+                            while let Some(p) = kids.pop() {
+                                seen += 1;
+                                if seen > MOST_NO_DROP_STEPS {
+                                    return Ok(None);
+                                }
+                                let n = adt.types.node(p)?;
+                                if matches!(n, crate::portable::PNode::Alias { .. }) {
+                                    projected = true;
+                                    break;
+                                }
+                                adt.types.children_of(n, &mut kids)?;
+                            }
+                        }
+                        let ft = self.lower(adt.types, f.ty, Lower::Args(args), Cause::Body)?;
+                        work.push(ft);
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(projected))
     }
 
     /// Whether a value of `t` holds no interior mutability and needs no drop (the module

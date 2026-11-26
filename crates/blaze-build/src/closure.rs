@@ -1076,6 +1076,7 @@ pub(crate) fn empty_record(a: Alloc<'_>) -> Checked<'_> {
         stalled: blaze_own::Vec::new_in(a),
         coroutine_witnesses: blaze_own::Vec::new_in(a),
         awaited: blaze_own::Vec::new_in(a),
+        no_drop: blaze_own::Vec::new_in(a),
         selected: blaze_own::Vec::new_in(a),
         fru_fields: blaze_own::Soa::new_in(a),
         default_fields: blaze_own::Soa::new_in(a),

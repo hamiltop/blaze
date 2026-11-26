@@ -272,3 +272,58 @@ fn main() {}
     let outcome = |n: &str| got.iter().find(|(m, _)| m == n).map(|(_, o)| o.as_str()).unwrap_or("");
     assert_ne!(outcome("t"), "clean", "{}", lines.join("\n"));
 }
+
+/// A field length naming an inherent constant whose own body names a sibling constant of the
+/// same type: regalloc2's `struct PRegSet { bits: [Bits; Self::LEN] }` with `const LEN: usize =
+/// (PReg::NUM_INDEX + Self::BITS - 1) / Self::BITS`. Checking `LEN`'s body reads the prefix
+/// `Self` of `Self::BITS` as the ADT, whose row's field needs `LEN`: refused as a cycle before
+/// heads.rs `ProvisionalAdt` (270 bodies of everything read `PRegSet`). The Reference,
+/// "Constant evaluation", refuses only a constant that needs ITSELF. The negative twin:
+/// `[u64; 5]` is E0308. Expected lines: "sibling in field length: four: clean",
+/// "sibling in field length: five: .." holding E0308.
+///
+/// CONTROL: with the `Err(why @ Why::ConstPath(..))` arm of the field loop in heads.rs
+/// `Store::adt` made `Err(why) => return Err(why)`, `four` prints "not checked: .. Self::LEN:
+/// the inherent constant is needed while it is being evaluated ..", and the test fails.
+#[test]
+fn a_field_length_whose_constant_reads_a_sibling() {
+    const TEXT: &str = "struct S { bits: [u64; Self::LEN] }
+impl S {
+    const BITS: usize = core::mem::size_of::<u64>() * 8;
+    const LEN: usize = (256 + Self::BITS - 1) / S::BITS;
+}
+fn four(s: S) -> [u64; 4] { s.bits }
+fn five(s: S) -> [u64; 5] { s.bits }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["four", "five"]);
+    let lines: Vec<String> = got.iter().map(|(n, o)| format!("sibling in field length: {n}: {o}")).collect();
+    for l in &lines {
+        println!("{l}");
+    }
+    let outcome = |n: &str| got.iter().find(|(m, _)| m == n).map(|(_, o)| o.as_str()).unwrap_or("");
+    assert_eq!(outcome("four"), "clean", "{}", lines.join("\n"));
+    assert!(outcome("five").contains("E0308"), "{}", lines.join("\n"));
+}
+
+/// The twin rustc refuses (E0391): `LEN` reads `S`'s layout, which needs `LEN`. The provisional
+/// row has no fields, and the evaluator's own reads never see it, so this stays refused, never
+/// a value of an empty `S`. Expected line: "layout cycle: t: not checked: .." (anything but
+/// "clean").
+#[test]
+fn a_field_length_whose_constant_reads_the_type_layout_is_refused() {
+    const TEXT: &str = "struct S { bits: [u64; Self::LEN] }
+impl S {
+    const LEN: usize = core::mem::size_of::<S>();
+}
+fn t(v: S) -> S { v }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["t"]);
+    let lines: Vec<String> = got.iter().map(|(n, o)| format!("layout cycle: {n}: {o}")).collect();
+    for l in &lines {
+        println!("{l}");
+    }
+    let outcome = |n: &str| got.iter().find(|(m, _)| m == n).map(|(_, o)| o.as_str()).unwrap_or("");
+    assert_ne!(outcome("t"), "clean", "{}", lines.join("\n"));
+}

@@ -420,18 +420,34 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
             Ok(site) if site.module == self.env.module && site.dollar_crate.is_none() => {}
             _ => return Ok(None),
         }
+        let mut block = false;
         if !abs {
             if first == "Self" || self.env.params.iter().any(|(n, _)| *n == Name::of(first)) {
                 return Ok(None);
             }
-            if !matches!(super::scope_table::value_prefix(
+            match super::scope_table::value_prefix(
                 &self.builder.resolver, self.locals, self.owner, self.env.module, Some(scope.0), first, texts.len() == 1, view.mark_of_path(p)?, tys.alloc(),
-            ), Ok((None, None))) {
-                return Ok(None);
+            ) {
+                Ok((None, None)) => {}
+                Ok(_) => block = true,
+                Err(_) => return Ok(None),
             }
         }
-        // A path the names library does not resolve is the world's to answer, as before.
-        let Ok(target) = self.builder.resolver.path(self.env.module, abs, &texts, Ns::Value) else { return Ok(None) };
+        // A first segment a body's block binds (`fn f() { use hkdf::Hkdf; Hkdf::<Sha256>::new(..) }`):
+        // read through the block's bindings as a written type path is
+        // (super::scope_table::written), and filled only where that names a struct's, enum's,
+        // union's or variant's segment; anything else is converted as written.
+        let target = if block {
+            let Some(body) = self.env.body else { return Ok(None) };
+            match super::scope_table::written(&self.builder.resolver, self.builder.marks, &body, view, p, abs, &texts, Ns::Value, r) {
+                Ok(Some(t)) if matches!(t.kind, Kind::Struct | Kind::Enum | Kind::Union | Kind::Variant { .. }) => t,
+                _ => return Ok(None),
+            }
+        } else {
+            // A path the names library does not resolve is the world's to answer, as before.
+            let Ok(target) = self.builder.resolver.path(self.env.module, abs, &texts, Ns::Value) else { return Ok(None) };
+            target
+        };
         // `Vec::<u8>::with_capacity(n)`: the struct's segment written short of parameters
         // that have defaults takes them (super::adt_paths, where the rule is quoted).
         if matches!(target.kind, Kind::Struct | Kind::Enum | Kind::Union) {

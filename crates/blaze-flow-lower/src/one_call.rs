@@ -713,6 +713,7 @@ struct CallOwner<'s> {
     heads: &'s dyn RegionTypes,
     bodies: BodyParams<'s>,
     closures: ClosureSigs<'s>,
+    static_assocs: &'s [(ItemKey, Name)],
 }
 
 impl Owner for CallOwner<'_> {
@@ -742,6 +743,9 @@ impl Owner for CallOwner<'_> {
     }
     fn body_params(&self, body: PTy) -> Option<&[u32]> {
         self.bodies.of(body)
+    }
+    fn alias_static(&self, trait_: ItemKey, name: Name) -> bool {
+        self.static_assocs.iter().any(|&(k, n)| k == trait_ && n == name)
     }
 }
 
@@ -1170,6 +1174,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 heads: &heads,
                 bodies: BodyParams { rows: &body_rows, held: &held },
                 closures: ClosureSigs { rows: &closure_rows, regs: &closure_regs },
+                static_assocs: facts.static_assocs(),
             };
             let mut sink = Sink { b: &mut self.b, static_, dyn_ph: &mut self.dyn_bound_placeholders, drop_next: drop_first };
             let mut cx = Cx { types: &caller, sig_types: &heads, selected: &sel, owner: &who, origins: &col, out: &mut sink };
@@ -1313,6 +1318,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             heads: &heads,
             bodies: BodyParams { rows: &body_rows, held: &held },
             closures: ClosureSigs { rows: &[], regs: &[] },
+            static_assocs: facts.static_assocs(),
         };
         let mut sink = Sink { b: &mut self.b, static_, dyn_ph: &mut self.dyn_bound_placeholders, drop_next: false };
         let mut cx = Cx { types: &caller, sig_types: &heads, selected: &sel, owner: &who, origins: &col, out: &mut sink };
@@ -1433,11 +1439,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             return self.one_refuse(item, OneRuleWhy::PositionsNotSlots { node: ty.ty }, e);
         }
         let start = u32::try_from(col.len()).unwrap_or(u32::MAX);
+        // Each argument is one use of its value ([`Lower::bound_instance`]).
+        let mut bound: Vec<(Origin, Origin), A> = Vec::new_in(self.alloc);
         for k in pi.start..pi.start + pi.len {
-            match self.origs.get(k as usize) {
-                Some(&o) => col.push(o),
-                None => return self.refuse(Form::Malformed, e),
-            }
+            let Some(&o) = self.origs.get(k as usize) else { return self.refuse(Form::Malformed, e) };
+            let o = self.bound_instance(o, &mut bound);
+            col.push(o);
         }
         match SlotRange::new(Slot::new(start), SlotCount::new(n)) {
             Some(at) => Ok(Arg { ty: ty.ty, at }),

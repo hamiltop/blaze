@@ -1484,6 +1484,14 @@ fn wrap(args: Vec<OsString>, macro_crate: &str) -> ! {
         blaze_script::exit(1);
     };
     rest.push(format!("-Clink-arg={object}").into());
+    // The macro crate is a registry crate built as this workspace's member, so cargo passes it
+    // no `--cap-lints allow` as it would a dependency: a crate's own `#![deny(..)]` would turn a
+    // lint newer than the crate into an error (ts-rs-macros 10.1.0's `#![deny(unused)]` over its
+    // `#![macro_use]`, a future-incompatibility warning on this toolchain). Capped as cargo caps
+    // it in any build that uses it.
+    if !text.iter().any(|it| it == "--cap-lints" || it.starts_with("--cap-lints=")) {
+        rest.extend(["--cap-lints".into(), "allow".into()]);
+    }
     let out_dir = text.windows(2).find(|pair| pair[0] == "--out-dir").map(|pair| pair[1].clone()).unwrap_or_default();
     let extra = text.iter().find_map(|it| it.strip_prefix("extra-filename=")).unwrap_or("").to_owned();
     // The custom target has no self-contained folder of its own in the sysroot: wasi-libc and
@@ -1986,7 +1994,13 @@ fn main_with(args: &Args, heap: &blaze_own::Heap) -> i32 {
     let target_source = tree.join("crates/blaze-proc-macro/guest/wasm32-wasip1-macro.json");
     let target_bytes = std::fs::read(&target_source).unwrap_or_else(|error| fail(Failure::Io { path: target_source.clone(), error }));
     // The target file's name is the target's name; its folder is under `work`, so it is remapped.
-    let target_json = work.join("wasm32-wasip1-macro.json");
+    // Cargo hands that name to every build script in the closure as `TARGET`, and a script may
+    // parse it: target-lexicon 0.13.5's build.rs (under wasmtime-environ, so wiggle-macro's
+    // closure) panics on `wasm32-wasip1-macro`. `wasm32-unknown-wasip1` is a triple it parses
+    // to the one `wasm32-wasip1` names (the `TARGET` blaze gives a macro-side script,
+    // blaze-cli scripts.rs `MACRO_TARGET`) and no builtin target's name, so rustc reads no
+    // sysroot std for it. The module's key holds the file's digest, never its name.
+    let target_json = work.join("wasm32-unknown-wasip1.json");
     write(&target_json, &target_bytes).unwrap_or_else(|failure| fail(failure));
     let shim_path = tree.join("crates/blaze-proc-macro/guest/shim.rs");
     let shim_text = read(&shim_path).unwrap_or_else(|failure| fail(failure));

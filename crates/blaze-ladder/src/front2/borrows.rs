@@ -25,7 +25,7 @@ use blaze_typeck as tc;
 use core::alloc::Allocator;
 
 use super::body::Body;
-use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, assoc_copy_read, clauses_read, copy_supertrait_read, file_borrow_reads, head_read, impl_read};
+use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, assoc_copy_read, assoc_static_read, clauses_read, copy_supertrait_read, file_borrow_reads, head_read, impl_read};
 use super::check::{Records, answer_impls, eval_len};
 use super::reads::Read;
 use super::borrows_nested::{FlowOf, NestedFacts, Requirements, closure_flow_of, flow_of, nested_inner_first, nested_range, next_nested};
@@ -291,6 +291,7 @@ impl core::fmt::Display for BorrowRefused {
                 use blaze_flow_lower::External;
                 let endpoint = |end| match end {
                     Some(External::Sig) => "External::Sig",
+                    Some(External::Output(_)) => "async block output",
                     Some(External::SigOwner(_)) => "External::SigOwner",
                     Some(External::Late) => "External::Late",
                     Some(External::Env) => "External::Env",
@@ -517,6 +518,9 @@ pub struct BorrowFacts<'a> {
     /// `PNode::Alias` types in this body bounded by `Copy` (via their associated type's own
     /// trait bounds or the body owner's `where` clauses), sorted by `PTy::0` (`Facts::alias_copy`).
     alias_copy: AVec<'a, u32>,
+    /// The associated types (trait, name) of the body's `PNode::Alias` types whose item
+    /// declares `: 'static` (`type Data: 'static;`): `Facts::static_assocs`.
+    static_assocs: AVec<'a, (tc::ItemKey, tc::Name)>,
     /// Per callee with a made head, sorted. Its signature regions are NOT here: the lowering
     /// reads them from the head records ([`BorrowFacts::read_by`], D148), each in place.
     callees: AVec<'a, (u128, CalleeFacts)>,
@@ -651,6 +655,7 @@ impl<'a> BorrowFacts<'a> {
             drop_lt_need: AVec::new_in(alloc),
             param_copy: AVec::new_in(alloc),
             alias_copy: AVec::new_in(alloc),
+            static_assocs: AVec::new_in(alloc),
             callees: AVec::new_in(alloc),
             calls: super::call_generics::CallBoundsTable::new_in(alloc),
             ties: ties::TiesTable::new_in(alloc),
@@ -808,6 +813,9 @@ impl Facts for ReadBy<'_, '_> {
     }
     fn alias_copy(&self, alias: tc::PTy) -> bool {
         self.facts.alias_copy.binary_search(&alias.0).is_ok()
+    }
+    fn static_assocs(&self) -> &[(tc::ItemKey, tc::Name)] {
+        &self.facts.static_assocs
     }
     fn shape(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Shape<'_>> {
         let at = self.facts.shapes.binary_search_by_key(&item.0, |(k, _)| *k).ok()?;
@@ -1943,6 +1951,43 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         }
         g.alias_copy.sort_unstable();
         g.alias_copy.dedup();
+    }
+    // Which `PNode::Alias` types in this body outlive `'static` by their associated type item's
+    // own bounds (`type Data: 'static;`): an item bound is a `TypeOutlives` clause of the
+    // associated item whose type is the projection of itself (as `alias_copy` reads its trait
+    // bounds). One `BorrowHead` row per associated item read (rule 21).
+    {
+        let body_tys = c.types.view();
+        let mut seen: AVec<'a, (u128, bool)> = AVec::new_in(alloc);
+        for n in body_tys.nodes() {
+            let tc::PNode::Alias { trait_, name, .. } = *n else { continue };
+            let Ok(pos) = g.assoc_items.binary_search_by_key(&(trait_.0, name), |&(k, nm, _)| (k, nm)) else { continue };
+            let Some(&(_, _, a_item)) = g.assoc_items.get(pos) else { continue };
+            let is_static = if let Some(&(_, s)) = seen.iter().find(|&&(k, _)| k == a_item.0) {
+                s
+            } else {
+                let mut s = false;
+                if let Some(ap) = r.store.preds.get(&a_item) {
+                    let stys = r.store.tys.view();
+                    for ac in ap.clauses.iter() {
+                        if let tc::PClause::TypeOutlives { ty, region: tc::regions::Region::Static } = *ac
+                            && let Ok(tc::PNode::Alias { trait_: at, name: an, .. }) = stys.node(ty)
+                            && at == trait_
+                            && an == name
+                        {
+                            s = true;
+                            break;
+                        }
+                    }
+                }
+                seen.push((a_item.0, s));
+                g.reads.push(assoc_static_read(a_item.0, s));
+                s
+            };
+            if is_static && !g.static_assocs.iter().any(|&(k, nm)| k == trait_ && nm == name) {
+                g.static_assocs.push((trait_, name));
+            }
+        }
     }
     // Gather RPITIT synthetic metadata (`rpitit_opaques`, overriding `impl_fns`, and `Twin`
     // default opaque regions) before ADT/read collection so every overriding impl fn and Twin

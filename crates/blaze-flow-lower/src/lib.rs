@@ -517,6 +517,14 @@ pub trait Facts {
     fn alias_copy(&self, _alias: PTy) -> bool {
         false
     }
+    /// The associated types (trait, name) of this body's projections that outlive `'static` by
+    /// their item's own bounds (`trait AsContext { type Data: 'static; }`): the Reference,
+    /// "Trait and lifetime bounds" (an associated type's declared bounds hold of every
+    /// projection of it), as rustc's `projection_must_outlive` reads the item bounds before
+    /// the components rule. Such a projection holds no region a bound can fail at.
+    fn static_assocs(&self) -> &[(ItemKey, Name)] {
+        &[]
+    }
 }
 
 /// Which check of a signature's laying refused it ([`Form::SigPositionsUnaligned`]). `input`:
@@ -1700,6 +1708,9 @@ pub struct DropWalk<'a, 'c, F: Facts, A: Allocator + Copy> {
     pub copy_memo: &'a [core::cell::Cell<u8>],
     pub drop_memo: &'a [core::cell::Cell<u8>],
     pub closures: ClosureDrop<'a, 'c>,
+    /// The ADT types the check proved need no drop at their arguments
+    /// (`blaze_typeck::Checked::no_drop`, sorted), though their ADT's facts say it may.
+    pub no_drop: &'a [PTy],
     pub alloc: A,
 }
 
@@ -1783,6 +1794,9 @@ pub fn pty_needs_drop<'a, 'c, F: Facts, A: Allocator + Copy, E>(
             PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
             PNode::Adt(k, l) => {
                 let f = walk.facts.adt(k).ok_or_else(|| on_err(DropWalkError::UnknownAdt))?;
+                if walk.no_drop.binary_search_by_key(&t.0, |p| p.0).is_ok() {
+                    continue;
+                }
                 if f.needs_drop {
                     if let Some(rc) = walk.drop_memo.get(root_ix) {
                         rc.set(2);
@@ -2543,6 +2557,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         if self.plant != Plant::NoRequirements && R::RELATES {
             let facts: &'b F = self.facts;
             for r in facts.closure_requirements(e) {
+                // An async block's output has no position here: proven where it has one
+                // (`unsize_future_to_object`, `await_unrelated`).
+                if matches!(r.from, Need::Output(_)) || matches!(r.into, Need::Output(_)) {
+                    continue;
+                }
                 let from = self.need_origin(r.from, ci, caps, e)?;
                 let into = self.need_origin(r.into, ci, caps, e)?;
                 self.b.subset(from, into);
@@ -2562,7 +2581,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             Need::OwnerParam(i) => Ok(self.universal(Region::Param(i))),
             Need::Param(u) => Ok(self.param_origin(u)),
             Need::DynPlaceholder(ord) => Ok(self.dyn_placeholder_origin(ord)),
-            Need::Capture(_) | Need::Sig(_) => self.refuse(Form::Malformed, e),
+            Need::Capture(_) | Need::Sig(_) | Need::Output(_) => self.refuse(Form::Malformed, e),
         }
     }
 
@@ -2638,6 +2657,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 copy_memo: &self.copy_memo,
                 drop_memo: &self.drop_memo,
                 closures: ClosureDrop::Ignore,
+                no_drop: &self.ck.no_drop,
                 alloc: self.alloc,
             },
             root,
@@ -2767,7 +2787,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         for _ in 0..af.lifetimes {
                             todo.push(Step::Pos(OriginLive::Full));
                         }
-                    } else if mode == DropMode::None || af.union {
+                    } else if mode == DropMode::None || af.union || (!af.drop_impl && self.ck.no_drop_of(ty)) {
+                        // `no_drop_of`: the check normalized this instance's fields and found no
+                        // code run on its drop (`Split<'_, char>`), whatever the ADT's generic
+                        // facts say of a projection field.
                         for &x in args.iter().rev() {
                             todo.push(Step::Ty(x, DropMode::None));
                         }
@@ -3588,6 +3611,25 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             }
         }
         Ok(())
+    }
+
+    /// `o` as one use of a value reads it: a region a fn-pointer type of the body's signature
+    /// binds (`universal` of a `Late`: one existential per binder variable, no region of the
+    /// fn) is instanced anew at each use (the Reference, "Subtyping and Variance": `for<'r>
+    /// fn(&'r u8) -> &'r u8` is a subtype of each of its instances, one per use); every other
+    /// origin is itself. `bound` pairs the use's instances, so the variable stays one region
+    /// within the use. One origin shared by every use made two calls' instances of a callee's
+    /// binder (each a placeholder) one region: `k(g); k(g)` was a spurious outlives finding.
+    pub(crate) fn bound_instance(&mut self, o: Origin, bound: &mut Vec<(Origin, Origin), A>) -> Origin {
+        if !self.facts.fn_binders() || !self.uni.iter().any(|&(r, x)| x == o && matches!(r, Region::Late { .. })) {
+            return o;
+        }
+        if let Some(&(_, f)) = bound.iter().find(|(x, _)| *x == o) {
+            return f;
+        }
+        let f = self.b.origin(false);
+        bound.push((o, f));
+        f
     }
 
     /// The placeholder origin of a region of the body's own signature. `'static` outlives every
@@ -5309,6 +5351,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let body = self.body;
         match self.expr(e)? {
             Expr::Missing => return self.refuse(Form::Missing, e),
+            Expr::ConstBlock { tail: Some(t), .. } if self.const_closure_tail(e) => self.tasks.push(Task::Eval(t, false)),
             Expr::Lit(_) | Expr::OffsetOf { .. } | Expr::ConstBlock { .. } => self.vals.push(Val { at: At::Const, ty }),
             Expr::Local(p) => {
                 let (pl, lt) = self.binding_place(p, e)?;
@@ -5978,17 +6021,50 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 | AdjustKind::UnsafeFnPointer
                 | AdjustKind::MutToConstPointer
                 | AdjustKind::Unsize => {
-                    if matches!(kind, AdjustKind::ClosureFnPointer | AdjustKind::Unsize) {
+                    // A closure coerced to the fn pointer that expected its signature keeps its
+                    // owner positions as the pointer's (closure.rs `closure_fn_ptr_sig`).
+                    let fn_ptr_closure = match v.at {
+                        At::Place(cp) if kind == AdjustKind::ClosureFnPointer && v.ty.wrap.is_none() && out.wrap.is_none() => Some(cp),
+                        _ => None,
+                    };
+                    if matches!(kind, AdjustKind::ClosureFnPointer | AdjustKind::Unsize) && fn_ptr_closure.is_none() {
                         self.closure_sig_kept(v.ty.ty, e)?;
                     }
+                    let vt = v.ty.ty;
                     let op = self.operand(v, e)?;
                     let t = self.temp(out, e)?;
                     let tp = self.place_of(t);
                     self.b.aggregate(tp, &[op], self.span(e));
+                    // Tied: a closure made a fn pointer captures nothing (E0308), so its
+                    // positions are its owner signature's, each now the pointer's own.
+                    let mut tied = false;
+                    if let Some(cp) = fn_ptr_closure {
+                        tied = self.closure_fn_ptr_sig(vt, cp, tp, e)?;
+                        if !tied {
+                            self.closure_sig_kept(vt, e)?;
+                        }
+                    }
                     if let At::Place(p) = v.at
-                        && !(kind == AdjustKind::Unsize && self.unsize_to_object(p, v.ty, tp, out, e)?)
+                        && !tied
+                        && !(kind == AdjustKind::Unsize
+                            && (self.unsize_to_object(p, v.ty, tp, out, e)? || self.unsize_future_to_object(p, v.ty, tp, out, e)?))
                     {
-                        self.relate(p, tp, out, e)?;
+                        if kind == AdjustKind::Unsize && self.unsize_reaches_object(v.ty, out, e)? {
+                            // A value made a trait object some other way: the object's positions
+                            // (its lifetime, its arguments' and bindings') are not the source's,
+                            // so `relate`'s position-by-position pairing of two equal counts
+                            // would tie unrelated regions (an async block's capture to the
+                            // `'static` of a `dyn Tr` in its `Output`). Made equal, noted.
+                            let (s, d) = (self.info(p), self.info(tp));
+                            if s.len > 0 && d.len > 0 && self.plant != Plant::NoRelate {
+                                if s.len + d.len > 2 {
+                                    self.coarse_step(Form::Unified { why: Unified::ValueInexact }, e);
+                                }
+                                self.unify(&[p, tp]);
+                            }
+                        } else {
+                            self.relate(p, tp, out, e)?;
+                        }
                     }
                     Val { at: At::Place(tp), ty: out }
                 }
@@ -6250,6 +6326,136 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         self.b.subset(self.origs[s.start as usize], d0);
         for j in s.start + 1..s.start + s.len {
             self.b.subset(self.origs[j as usize], q);
+        }
+        Ok(true)
+    }
+
+    /// The innermost pair of an unsized coercion's source and destination types that differ,
+    /// peeling one layer at a time: two applications of one ADT (`Box`, `Pin`, `Rc`, ..) whose
+    /// arguments are equal but one, and, when `refs`, two references of one mutability. `None`
+    /// when a layer does not peel so (two differing arguments, two different heads); `clean`
+    /// is cleared when a peeled layer has a position the differing argument does not (a
+    /// reference's, an ADT's lifetime or another argument's).
+    fn unsize_peel(&self, mut from: PTy, mut to: PTy, refs: bool, clean: &mut bool, e: ExprId) -> Result<Option<(PTy, PTy)>, Refusal> {
+        for _ in 0..16 {
+            if from == to {
+                return Ok(None);
+            }
+            match (self.node(from, e)?, self.node(to, e)?) {
+                (PNode::Adt(k, l), PNode::Adt(k2, l2)) if k == k2 => {
+                    let (a, b) = (self.list(l, e)?, self.list(l2, e)?);
+                    if a.len() != b.len() {
+                        return Ok(None);
+                    }
+                    let mut at = None;
+                    for i in 0..a.len() {
+                        if a[i] != b[i] {
+                            if at.is_some() {
+                                return Ok(None);
+                            }
+                            at = Some(i);
+                        }
+                    }
+                    let Some(i) = at else { return Ok(None) };
+                    if self.npos(from, e)? != self.npos(a[i], e)? || self.npos(to, e)? != self.npos(b[i], e)? {
+                        *clean = false;
+                    }
+                    (from, to) = (a[i], b[i]);
+                }
+                (PNode::Ref(m, i), PNode::Ref(m2, i2)) if refs && m == m2 => {
+                    *clean = false;
+                    (from, to) = (i, i2);
+                }
+                _ => return Ok(Some((from, to))),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether the unsized coercion of a `from` to a `to` makes a value that is not a trait
+    /// object one (`T` to `dyn Tr`, under the same pointers).
+    fn unsize_reaches_object(&self, from: TyD, to: TyD, e: ExprId) -> Result<bool, Refusal> {
+        if from.wrap != to.wrap {
+            return Ok(false);
+        }
+        let mut clean = true;
+        let Some((f, t)) = self.unsize_peel(from.ty, to.ty, true, &mut clean, e)? else { return Ok(false) };
+        Ok(matches!(self.node(t, e)?, PNode::Dynamic(_)) && !matches!(self.node(f, e)?, PNode::Dynamic(_)))
+    }
+
+    /// The unsized coercion of `src: from`, an async block of this body under pointers that
+    /// hold no other position (`Pin<Box<{async block}>>`, `Box<{async block}>`), to `dst: to`,
+    /// the same pointers to `dyn Future<Output = T> + 'q` (auto traits aside). Rust asks
+    /// `{block}: 'q` and `{block}: Future<Output = T>` (the Reference, "Type coercions",
+    /// unsized coercions): every capture's position outlives `'q`, one way, and the block's
+    /// output IS `T` (a projection is invariant), so what the block's body needs between its
+    /// captures and its output (its [`Need::Output`] requirements, [`Facts::closure_requirements`]
+    /// of the block) is stated here between the captures' positions and `T`'s. `false`, relating
+    /// nothing: not such a coercion.
+    fn unsize_future_to_object(&mut self, src: Place, from: TyD, dst: Place, to: TyD, e: ExprId) -> Result<bool, Refusal> {
+        if from.wrap.is_some() || to.wrap.is_some() || self.plant == Plant::NoRelate || !R::RELATES {
+            return Ok(false);
+        }
+        let (s, d) = (self.info(src), self.info(dst));
+        if !s.exact || !d.exact || d.len == 0 {
+            return Ok(false);
+        }
+        let mut clean = true;
+        let Some((f, t)) = self.unsize_peel(from.ty, to.ty, false, &mut clean, e)? else { return Ok(false) };
+        if !clean {
+            return Ok(false);
+        }
+        let PNode::Future(fe, out, _) = self.node(f, e)? else { return Ok(false) };
+        let PNode::Dynamic(preds) = self.node(t, e)? else { return Ok(false) };
+        if self.npos(f, e)? != s.len || 1 + self.npos(out, e)? != d.len {
+            return Ok(false);
+        }
+        let facts: &'b F = self.facts;
+        let out_name = Name::of("Output");
+        let mut term = None;
+        for &p in self.list(preds, e)? {
+            match self.node(p, e)? {
+                PNode::ExAuto(_) if self.npos(p, e)? == 0 => {}
+                PNode::ExTrait(k, args) if facts.is_future_trait(k) && self.list(args, e)?.is_empty() => {}
+                PNode::ExProj { trait_: k, name, args, term: t } if facts.is_future_trait(k) && name == out_name && term.is_none() => {
+                    if !self.list(args, e)?.is_empty() {
+                        return Ok(false);
+                    }
+                    term = Some(t);
+                }
+                _ => return Ok(false),
+            }
+        }
+        let Some(term) = term else { return Ok(false) };
+        // The block's output and `T` are one type (`Future::Output` is a projection: equal, not
+        // a subtype), so each lays its positions in the same order: position `k` of the
+        // block's output, as its body's flow laid it, is position `k` of `T`.
+        if out != term || self.npos(term, e)? != d.len - 1 {
+            return Ok(false);
+        }
+        let q = self.origs[d.start as usize];
+        for j in s.start..s.start + s.len {
+            self.b.subset(self.origs[j as usize], q);
+        }
+        let n_out = d.len - 1;
+        for r in facts.closure_requirements(fe) {
+            if !matches!(r.from, Need::Output(_)) && !matches!(r.into, Need::Output(_)) {
+                continue;
+            }
+            let mut end = |n: Need| -> Result<Origin, Refusal> {
+                match n {
+                    Need::Output(k) if k < n_out => Ok(self.origs[(d.start + 1 + k) as usize]),
+                    Need::Capture(k) if k < s.len => Ok(self.origs[(s.start + k) as usize]),
+                    Need::Static => Ok(self.universal(Region::Static)),
+                    Need::OwnerParam(i) => Ok(self.universal(Region::Param(i))),
+                    Need::Param(u) => Ok(self.param_origin(u)),
+                    Need::DynPlaceholder(ord) => Ok(self.dyn_placeholder_origin(ord)),
+                    Need::Output(_) | Need::Capture(_) | Need::Sig(_) => self.refuse(Form::Malformed, e),
+                }
+            };
+            let from = end(r.from)?;
+            let into = end(r.into)?;
+            self.b.subset(from, into);
         }
         Ok(true)
     }
@@ -6731,6 +6937,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             false
         };
         let builtin = base.ty.wrap.is_none() && matches!(self.node(base.ty.ty, e)?, PNode::Array(..) | PNode::Slice(_));
+        // A shared index of a promotable rvalue (`&["a", "b"][..]`, `Index::index` of an
+        // array, lowered here as the builtin projection): the checker listed the base in
+        // `Checked::promoted` (rules/promote.rs), so the receiver borrows a `'static` slot.
+        let static_base = static_base
+            || (!m
+                && matches!(self.expr(e)?, Expr::Index { base: be, .. }
+                    if self.ck.promoted.binary_search_by_key(&be.0, |x| x.0).is_ok()));
         if builtin {
             if let At::Place(ip) = idx.at {
                 // The index is read before the place is used.

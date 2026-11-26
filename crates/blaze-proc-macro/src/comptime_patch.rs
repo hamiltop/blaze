@@ -31,7 +31,7 @@ use blaze_expand::{
 use blaze_own::{AVec, Alloc};
 
 /// Versioned digest domain used when caching pure comptime-patch expansions.
-pub const COMPTIME_PATCH_VERSION: &[u8] = b"blaze-comptime-patch-v3";
+pub const COMPTIME_PATCH_VERSION: &[u8] = b"blaze-comptime-patch-v4";
 
 /// Cumulative telemetry counters for the built-in comptime patch library.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -1128,6 +1128,15 @@ fn expand_serde(stream: &TokenStream<'_>, is_deserialize: bool) -> Option<String
     let cattrs = parse_serde_container_attrs(&adt.attrs)?;
     // Let real serde_derive handle borrowed `'de: 'a` lifetimes on Deserialize.
     if is_deserialize && adt.has_lifetimes() {
+        return None;
+    }
+    // A field borrowing for `'static` (`struct Id(&'static str)`): serde_derive deserializes
+    // the whole type from `Deserializer<'static>` only (its `BorrowedLifetimes::Static`, the
+    // impl `Deserialize<'static>`), which this patch's `impl<'de> Deserialize<'de>` does not
+    // write: its visitor asks `'de: 'static` of a `'de` nothing bounds. Real serde_derive.
+    if is_deserialize
+        && adt.variants.iter().flat_map(|v| v.fields.iter()).any(|f| f.ty.split_whitespace().collect::<String>().contains("'static"))
+    {
         return None;
     }
     // Check all variant & field serde attributes up front (bail cleanly to fallback on exotic ones).
@@ -3112,7 +3121,7 @@ mod tests {
             b"blaze-comptime-patch-v2",
             "v3 expansion changes struct Deserialize missing-field semantics and must not share v2's digest domain"
         );
-        assert_eq!(COMPTIME_PATCH_VERSION, b"blaze-comptime-patch-v3");
+        assert_eq!(COMPTIME_PATCH_VERSION, b"blaze-comptime-patch-v4");
     }
 
     #[test]

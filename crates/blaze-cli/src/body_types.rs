@@ -160,6 +160,16 @@ impl<'f> SyncLazyTrees<'f> {
         }
     }
 
+    /// The home whose file area holds a native script's stored `OUT_DIR` files.
+    pub(crate) fn home(&self) -> Option<&'f str> {
+        self.home
+    }
+
+    /// The crate list whose trees these are.
+    pub(crate) fn list(&self) -> &CrateList<'static> {
+        &self.list
+    }
+
     pub(crate) fn new_in_heap(home: Option<&str>, heap: &'static blaze_own::Heap, list: CrateList<'static>) -> Result<&'static SyncLazyTrees<'static>, &'static str> {
         let g = heap.alloc();
         let mut slots: AVec<'static, bstd::sync::PublishOnce<Result<PackView<'static>, &'static str>>> = AVec::new_in(g);

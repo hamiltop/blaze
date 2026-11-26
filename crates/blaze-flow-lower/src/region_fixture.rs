@@ -579,6 +579,9 @@ impl<F: Facts> Facts for WithRegions<'_, F> {
     fn alias_copy(&self, alias: PTy) -> bool {
         self.base.alias_copy(alias)
     }
+    fn static_assocs(&self) -> &[(blaze_typeck::ItemKey, blaze_typeck::Name)] {
+        self.base.static_assocs()
+    }
     fn ties(&self, item: ItemKey) -> Option<Ties<'_>> {
         self.base.ties(item)
     }

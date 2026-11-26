@@ -1486,6 +1486,12 @@ struct Group<'f, 'r> {
     /// script run read for it (a `Script` task's WHOLE cell), in every body's read list.
     env: Option<EnvLent<'f, 'f>>,
     script: Option<Name>,
+    /// Each scope crate's build-script run input by its list row, sorted: what a dependency's
+    /// environment is made of when one of its texts is asked (an `OUT_DIR` include read through
+    /// its script record: front_load.rs `read_file`, run_names.rs `RunEnvs`).
+    scripts: Vec<(usize, Input), Global>,
+    /// The home whose file area holds a native script's stored `OUT_DIR` files.
+    home: Option<&'f str>,
     /// The places of its lang crates among `crates`.
     lang: Vec<usize, Global>,
     /// Each scope crate's `CrateScope` name, sorted: the whole graph's bucket fact widens to these.
@@ -2543,7 +2549,7 @@ impl<'n> blaze_ladder::front2::source::Load<'n> for BodiesLoad<'n> {
         {
             return self.inner.file_items(krate, index, path, surface, edition, bump);
         }
-        let Some(text) = blaze_scope::resolve::SourceTexts::read(self.texts, krate, &full) else {
+        let Some(text) = crate::front_load::read_file(self.texts, krate, &full) else {
             return Ok(None);
         };
         let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
@@ -2589,6 +2595,31 @@ impl<'n> blaze_ladder::front2::source::Load<'n> for BodiesLoad<'n> {
 /// flags, planned outlines, and cached dependency file outlines.
 #[inline(never)]
 #[expect(clippy::too_many_arguments, reason = "a stretch's records edge: each argument one input of them")]
+/// Each crate of `crates` with a build script, by its list row, with its script run's input
+/// (`handed`), sorted by row: [`Group::scripts`]. A script whose input is not handed is left out;
+/// that crate's environment is then refused by name at its first ask (run_names.rs `RunEnvs`).
+fn group_scripts(list: &blaze_world::crate_list::CrateList<'static>, crates: &GroupCrates<'_>, handed: &dyn Fn(Name) -> Option<Input>) -> Vec<(usize, Input), Global> {
+    let mut rows: Vec<usize, Global> = Vec::new_in(Global);
+    match crates {
+        GroupCrates::Opened(crates) => rows.extend(crates.iter().map(|one| one.world_at)),
+        GroupCrates::ByNeed { own, rest } => {
+            rows.push(own.world_at);
+            rows.extend(rest.iter().map(|one| one.world_at));
+        }
+    }
+    let mut out = Vec::new_in(Global);
+    for row in rows {
+        if let Ok(Some(script)) = crate::body_types::owner_script(list, row)
+            && let Some(input) = handed(script)
+        {
+            out.push((row, input));
+        }
+    }
+    out.sort_unstable_by_key(|(row, _)| *row);
+    out.dedup_by_key(|(row, _)| *row);
+    out
+}
+
 fn open_stretch_records<'n>(
     cx: &'n Cx,
     root: &'n Dir<ReadWrite>,
@@ -2602,6 +2633,8 @@ fn open_stretch_records<'n>(
     corrected: &'n [(u32, &'n str, &'n str)],
     procs: Option<&'n crate::proc_runner::ProcRunner<'static>>,
     env: Option<&'n blaze_scope::crate_env::CrateEnv<'n>>,
+    scripts: &'n [(usize, Input)],
+    home: Option<&'n str>,
     snapshot: &'n StoreSnapshot,
     expansion_keys: &'n SharedSet<Key, SharedAlloc<'static>>,
     frame: &'n Frame,
@@ -2644,6 +2677,10 @@ fn open_stretch_records<'n>(
     let packages: &'n [&'n str] = packages.into_bump_slice();
     let world_ats: &'n [usize] = world_ats.into_bump_slice();
     let callers: &'n [(usize, usize, blaze_expand::Edition)] = callers.into_bump_slice();
+    // Every crate past the member made at its first ask (run_names.rs `RunEnvs`), so a
+    // dependency's text read from its build script's `OUT_DIR` (pprof's `include!` of its
+    // generated `mod.rs`) is found here as the names task found it.
+    let envs: &'n crate::run_names::RunEnvs<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(crate::run_names::RunEnvs::new(list, world_ats, scripts, snapshot, home, frame), frame));
     let texts: &'n crate::job_texts::JobTexts<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
         crate::job_texts::JobTexts {
             cx,
@@ -2652,7 +2689,7 @@ fn open_stretch_records<'n>(
             packs,
             corrected,
             env: env.map(|env| (0, env)),
-            envs: None,
+            envs: Some(envs),
             read: RefCell::new(std::vec::Vec::new_in(Global)),
             unread: RefCell::new(Vec::new_in(frame)),
             data: RefCell::new(std::vec::Vec::new_in(Global)),
@@ -4676,7 +4713,11 @@ impl<'f> BodiesStage<'f> {
                         (Some(rest), Some(own)) => Some(GroupCrates::ByNeed { own, rest }),
                         (Some(_), None) => None,
                     };
-                    (whole, cut_words, cut_missing, scope_cells, crates.map(|crates| Group { list, own: own.name, crates, env, script, lang: scope.lang, scope: scope.scope }))
+                    (whole, cut_words, cut_missing, scope_cells, crates.map(|crates| {
+                        let scripts = group_scripts(&list, &crates, &|script| names.input_of(script));
+                        let home = handles.env.home.map(|home| &*frame.alloc_str(home));
+                        Group { list, own: own.name, crates, env, script, scripts, home, lang: scope.lang, scope: scope.scope }
+                    }))
                 }
                 None => (true, None, None, own_cells, None),
             };
@@ -6396,6 +6437,8 @@ fn run_stretch<'a, 'b, 'f, R: ?Sized + CellDigests>(
         shared.corrected,
         shared.procs,
         env,
+        &group.scripts,
+        group.home,
         shared.snapshot,
         shared.expansion_keys,
         frame,

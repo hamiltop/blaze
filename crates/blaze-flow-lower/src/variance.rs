@@ -342,9 +342,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
 
     /// `src`'s positions related into `dst`'s, one by one at `vs`: covariant `src: dst`,
     /// contravariant `dst: src`, invariant both (the module's HOW A RELATION USES IT).
+    /// Each relation is one use of `src`'s value: a region a fn-pointer type of the signature
+    /// binds is instanced anew for it ([`Lower::bound_instance`]).
     pub(crate) fn relate_by(&mut self, src_start: u32, dst_start: u32, vs: &[Variance]) {
+        let mut bound: Vec<(blaze_flow::Origin, blaze_flow::Origin), A> = Vec::new_in(self.alloc);
         for (k, &v) in vs.iter().enumerate() {
             let (a, b) = (self.origs[src_start as usize + k], self.origs[dst_start as usize + k]);
+            let a = self.bound_instance(a, &mut bound);
             self.relate_one(a, b, v);
         }
     }

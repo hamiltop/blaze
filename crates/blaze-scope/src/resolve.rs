@@ -1068,6 +1068,11 @@ impl<'a> Names<'a> {
         crate::names::traits_in_scope::<&'a str, _>(self, module, alloc)
     }
 
+    /// [`crate::names::glob_traits`] over these names.
+    pub fn glob_traits<'b>(&self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
+        crate::names::glob_traits::<&'a str, _>(self, module, alloc)
+    }
+
     /// A trait's or an impl's members on under its crate's cfg, in declaration order; `None`
     /// when `owner` is no trait or impl held.
     pub fn members(&self, owner: ItemKey) -> Option<&[Member<'a>]> {
@@ -4151,6 +4156,12 @@ fn expand_call<'a, S: SourceTexts<'a>>(
         }
         _ => None,
     };
+    // A build script's output, included: no current file, but its folder holds the modules
+    // its `mod x;` names (read from the script record, [`file_at`]).
+    let included_output: Option<&'a str> = match (mac.body, included, base.script) {
+        (MacroBody::BuiltinFn("include"), None, Some(out)) => crate::included::included_output(out.out_dir(), &expansion.reads).map(|path| keep(path, home_bump)),
+        _ => None,
+    };
     let written = included.unwrap_or(calling);
     // Materialize `ExpansionTokens` into `home_bump` AT MOST ONCE, ONLY when a consumer needs it.
     let cached_tokens: core::cell::OnceCell<crate::nested_input::ExpansionTokens<'a>> = core::cell::OnceCell::new();
@@ -4195,7 +4206,7 @@ fn expand_call<'a, S: SourceTexts<'a>>(
         part(ExpandPart::Modules, mac.name, mods.len());
         // An `include!`'s file is the current file of what it writes ([`crate::included`]): a
         // `mod x;` in it is found from the INCLUDED file's folder, not the calling module's.
-        let included_dir: Option<&'a str> = included.map(|path| {
+        let included_dir: Option<&'a str> = included.or(included_output).map(|path| {
             let mut dir = AString::from_str_in(path, alloc);
             pop_dir(&mut dir);
             keep(&dir, home_bump)
@@ -4756,7 +4767,12 @@ fn file_at<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, path: 
         return Some((at, files.at(at as usize)));
     }
     let path = keep(path, base.bump);
-    let text = base.sources.read(base.index, path)?;
+    // A `mod x;` in a file `include!`d from the build script's `OUT_DIR` names a file there
+    // too: it is the script record's (already in the crate's key), never the source tree's.
+    let text = match base.script.and_then(|out| out.file_at(path)) {
+        Some(file) => core::str::from_utf8(base.script?.bytes_of(file?).ok()?).ok()?,
+        None => base.sources.read(base.index, path)?,
+    };
     let file = file_of(path, text, outline(text, base.edition, base.alloc), base.shown_from, base.bump);
     Some((files.add(file), file))
 }

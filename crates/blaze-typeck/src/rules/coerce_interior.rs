@@ -70,6 +70,16 @@ impl crate::stalled::Stalled {
         src: &mut S,
         types: PTys<'_>,
     ) -> Result<Goal, S::Error> {
+        // A projection row (machine.rs: a projection undecided only by this body's interior)
+        // is re-asked as the projection.
+        if let Some(Because::Unmet { goal: UnmetGoal::Projection { trait_, args, name, term }, .. }) = self.diag.because
+            && trait_ == self.trait_
+            && types.list(args)?.first() == Some(&self.ty)
+        {
+            let args = import_list(cx, src, types, args, &[], 0)?;
+            let term = import(cx, src, types, term, &[], 0)?;
+            return Ok(Goal::Projection { trait_, args, name, term });
+        }
         let args = match self.diag.because {
             Some(Because::Unmet { goal: UnmetGoal::Trait { trait_, args }, .. })
                 if trait_ == self.trait_ && types.list(args)?.first() == Some(&self.ty) =>

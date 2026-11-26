@@ -96,7 +96,8 @@ pub struct LoweredAsync<A: Allocator + Copy> {
     /// the one mechanism of closure.rs [`crate::External`]): a capture's positions are the
     /// future VALUE's (`External::Capture`, laid as `Lower::npos` of `PNode::Future` lays
     /// them: each capture in row order, a capture by reference its reference first), the
-    /// output's are `External::Sig` (the future's type holds no position for them), and
+    /// output's are `External::Output` (the future's type holds no position for them: a
+    /// requirement naming one is proven where the output gets positions, `Need::Output`), and
     /// `'static` is `External::Static`. An outlives result between two of the value's
     /// positions (or `'static`) is then a requirement the maker proves at the block
     /// expression ([`crate::requirement`], `Facts::closure_requirements` keyed by the block's
@@ -492,10 +493,16 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
             value_at += made - first;
             self.vars.push(l);
         }
-        // The return place: the block's output, its positions placeholders; every capture's
-        // placeholder is known to outlive every one of them (the output may hold what a capture
-        // by reference points to; a loan of the block's own locals or by-value captures is not
-        // known to outlive it and is refused, as a returned reference to a local is).
+        // The return place: the block's output, its positions placeholders. Nothing is known
+        // between them and the captures': what the body needs (a capture by reference returned:
+        // the capture outlives the output) is an outlives result naming `External::Output`, a
+        // requirement its maker proves where the output has positions ([`crate::Need::Output`]:
+        // an `.await` of the block relates them to the captures, its unsizing to `dyn Future`
+        // to the object's `Output`). A loan of the block's own locals or by-value captures is
+        // refused, as a returned reference to a local is. Assuming every capture outlives every
+        // output position instead made `Box::pin(async move { .. Ok(Box::new(x)) })` as
+        // `Pin<Box<dyn Future<Output = Result<Box<dyn Tr>, E>> + 't>>` ask each capture to
+        // outlive `'static` (async-trait's shape: an error rustc does not give).
         let out = match self.node(self.expr_ty(block)?, block)? {
             PNode::Future(fe, out, _) if fe == block => out,
             _ => return self.refuse(Form::TypeNode, block),
@@ -503,25 +510,21 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         let upvar_origins = self.origs.len();
         self.new_local_with(TyD::of(out), true, Some(Local(0)), block)?;
         let all = self.origs.len();
-        // The output's positions: no position of the future value holds them (`npos` of
-        // `PNode::Future` counts the captures only), so a requirement naming one cannot be
-        // stated at the block expression ([`crate::requirement`] gives `None`: refused by name).
+        let fn_root = block == self.body.root && self.body.coroutine.is_some();
         for o in upvar_origins..all {
-            externals.push((self.origs[o], External::Sig));
+            let w = match u32::try_from(o - upvar_origins) {
+                Ok(k) if !fn_root => External::Output(k),
+                _ => External::Sig,
+            };
+            externals.push((self.origs[o], w));
         }
         if (all - upvar_origins) as u64 * upvar_origins as u64 > u64::from(MOST_POSITIONS) {
             return self.refuse(Form::Bound, block);
         }
-        if block == self.body.root && self.body.coroutine.is_some() {
+        if fn_root {
             // An `async fn`'s root block: its captures are the fn's parameters and its value
             // the written return type, both the signature's (`async_fn_root`).
             self.async_fn_root(&rows, block)?;
-        } else {
-            for u in 0..upvar_origins {
-                for o in upvar_origins..all {
-                    self.b.known(self.origs[u], self.origs[o]);
-                }
-            }
         }
         self.tasks.push(Task::RootEnd(inner));
         self.tasks.push(Task::Eval(inner, false));
@@ -810,6 +813,35 @@ impl<'b, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 
         for &(a, b) in sig.bounds() {
             let (oa, ob) = (self.universal(a), self.universal(b));
             self.b.known(oa, ob);
+        }
+        // The bounds the signature's types imply, whole, as `Lower::signature` reads them for a
+        // fn body: an ADT's declared and inferred requirements too (`&Linker<T>` with
+        // `struct Linker<T: 'static>` gives `T: 'static`; wasmtime's generated
+        // `instantiate_async`). A type parameter's origin the walk already made (a capture's
+        // type) is related here; one made later takes them from `param_implied`.
+        if let Some((params, regions)) = facts.implied_bounds() {
+            let known = self.plant != crate::Plant::NoKnown;
+            for &(long, short) in regions {
+                let (ol, os) = (self.universal(long), self.universal(short));
+                if known {
+                    self.b.known(ol, os);
+                }
+            }
+            for &(p, r) in params {
+                let o = self.universal(r);
+                if !self.param_implied.contains(&(p, o)) {
+                    self.param_implied.push((p, o));
+                }
+                if known {
+                    for j in 0..self.param_origs.len() {
+                        let made = self.param_origs[j];
+                        if made.param == p {
+                            self.b.known(made.origin, o);
+                        }
+                    }
+                }
+            }
+            self.implied_given = true;
         }
         Ok(())
     }

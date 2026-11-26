@@ -403,6 +403,10 @@ struct Proj {
     /// position one way, and the caller's own type parameters its arguments hold by their
     /// placeholders. A trait object is related both ways (`false`).
     alias: bool,
+    /// The destination's alias outlives `'static` by its item bound (`Facts::alias_static`):
+    /// the caller's type parameters its arguments hold are not related to its position (the
+    /// components rule is for an alias no bound covers; rustc `projection_must_outlive`).
+    stat: bool,
     /// Whether this mark is an opaque return type (`Mark::Proj { opaque: Some(..), .. }`)
     /// rather than a trait associated-type projection: its captured arguments are values (not
     /// projected through a trait impl), so an opaque argument's lifetimes are its positions.
@@ -904,7 +908,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
     /// still a projection there, and the opaque type it is there (`PNode::Opaque`'s key, else
     /// `None`). `false`: the destination does not have those nodes.
     #[expect(clippy::type_complexity, reason = "one row per projection: count, still one, nested alias/opaque, opaque")]
-    fn proj_counts(&self, skel: &[Skel], dest_ty: TyD, out: &mut Vec<(u32, bool, bool, Option<ItemKey>), A>, e: ExprId) -> Result<bool, Refusal> {
+    fn proj_counts(&self, skel: &[Skel], dest_ty: TyD, out: &mut Vec<(u32, bool, bool, Option<ItemKey>, bool), A>, e: ExprId) -> Result<bool, Refusal> {
         out.clear();
         if dest_ty.wrap.is_some() {
             return Ok(false);
@@ -950,7 +954,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     };
                     let is_direct = matches!(node, PNode::Alias { .. } | PNode::Opaque(..));
                     let nested_proj = !is_direct && self.contains_proj_or_opaque(t, e)?;
-                    out.push((self.npos(t, e)?, is_direct, nested_proj, opaque));
+                    let stat = self.alias_static(node);
+                    out.push((self.npos(t, e)?, is_direct, nested_proj, opaque, stat));
                 }
                 _ => return Ok(false),
             }
@@ -1222,7 +1227,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         // The projections, opaque types and trait objects the parts hold, in the marks' order
         // (`Slot::Joined`); the output's projections' and opaque types' destination counts
         // (`proj_counts`), taken in order (`pk`).
-        let mut counts: Vec<(u32, bool, bool, Option<ItemKey>), A> = Vec::new_in(self.alloc);
+        let mut counts: Vec<(u32, bool, bool, Option<ItemKey>, bool), A> = Vec::new_in(self.alloc);
         let mut projs: Vec<Proj, A> = Vec::new_in(self.alloc);
         let mut pk = 0usize;
         // The type check's selections at this call (`Checked::selected_at`) are one per
@@ -1260,7 +1265,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         if let Some(&p) = ps.iter().find(|&&p| p as usize >= args.len()) {
                             return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: args.len() as u32 }, e);
                         }
-                        projs.push(Proj { lo, hi, rlo: r as u32, rhi: (r + n) as u32, alias: false, opaque: false, live: crate::OpaqueLive::Captures });
+                        projs.push(Proj { lo, hi, rlo: r as u32, rhi: (r + n) as u32, alias: false, stat: false, opaque: false, live: crate::OpaqueLive::Captures });
                         r += n;
                         seq.push(Slot::Joined((projs.len() - 1) as u32));
                     }
@@ -1320,7 +1325,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             continue;
                         }
                         // The destination's positions where it stands, in the marks' order.
-                        let Some(&(n, alias, nested_proj, there)) = counts.get(pk) else { return self.misfit(Misfit::Skeleton { part }) };
+                        let Some(&(n, alias, nested_proj, there, stat)) = counts.get(pk) else { return self.misfit(Misfit::Skeleton { part }) };
                         pk += 1;
                         // What the opaque value keeps live (rust-lang/rust#116733, lib.rs
                         // `opaque_live`). Its `+ 'r` region is in its own fn's numbering, so it
@@ -1333,7 +1338,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             (Some(_), Some(k)) if self.opaque_live(k) == crate::OpaqueLive::Nothing => crate::OpaqueLive::Nothing,
                             _ => crate::OpaqueLive::Captures,
                         };
-                        projs.push(Proj { lo, hi, rlo: prlo, rhi: prhi, alias, opaque: opaque.is_some(), live });
+                        projs.push(Proj { lo, hi, rlo: prlo, rhi: prhi, alias, stat, opaque: opaque.is_some(), live });
                         // The projection's type holds no lifetime here (`Iterator::find` on a
                         // `Map<_, F>` whose `Item = u32`): it relates nothing, so how its
                         // inputs hold their lifetimes does not matter. Before, a closure in
@@ -1518,7 +1523,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                                 self.b.subset(o, a);
                             }
                         }
-                        if pj.alias {
+                        if pj.alias && !pj.stat {
                             held.clear();
                             if let Some(&arg) = args.get(usize::try_from(p).unwrap_or(usize::MAX)) {
                                 self.outlives_components(arg, e, &mut held, true)?;

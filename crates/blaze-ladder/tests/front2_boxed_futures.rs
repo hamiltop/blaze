@@ -186,3 +186,59 @@ fn boxed_return_values_keep_the_future_output_and_stream_item() {
     assert_eq!(diag.code, "E0277", "{types:?}");
     assert!(diag.text.contains("Send"), "{types:?}");
 }
+
+/// async-trait's shape: an async block boxed and pinned as `dyn Future<Output = T> + 't`,
+/// where `T` holds a trait object (`'static` by default). The block's captures outlive `'t`;
+/// they need not outlive `T`'s regions unless the body returns them (blaze-flow-lower
+/// lib.rs `unsize_future_to_object`, coroutine.rs `run_async`: the block's needs between its
+/// captures and its output are requirements stated where the output is `T`). Each `_bad`
+/// twin is rustc's "lifetime may not live long enough".
+const ASYNC_TRAIT_SHAPE: &str = r#"
+use std::future::Future;
+use std::pin::Pin;
+pub struct E;
+pub trait Inst: Send {}
+pub struct I;
+impl Inst for I {}
+type F<'t, T> = Pin<Box<dyn Future<Output = T> + Send + 't>>;
+type R = Result<Box<dyn Inst>, E>;
+fn one<'l, 't>(x: &'l u8) -> F<'t, R> where 'l: 't {
+    Box::pin(async move { let _z = x; let r: R = Ok(Box::new(I)); r })
+}
+fn two<'l, 'm, 't>(x: &'l u8, y: &'m u8) -> F<'t, R> where 'l: 't, 'm: 't {
+    Box::pin(async move { let _z = x; let _w = y; let r: R = Ok(Box::new(I)); r })
+}
+fn returned<'l, 't>(x: &'l u8) -> F<'t, &'t u8> where 'l: 't {
+    Box::pin(async move { x })
+}
+fn returned_bad<'l>(x: &'l u8) -> F<'l, &'static u8> {
+    Box::pin(async move { x })
+}
+fn object_bad<'l, 't>(x: &'l u8) -> F<'t, u8> {
+    Box::pin(async move { *x })
+}
+fn main() {}
+"#;
+
+#[test]
+fn a_boxed_async_block_relates_its_captures_to_its_output_only_as_its_body_needs() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let home = std::env::var("HOME").expect("HOME");
+    let toolchain = Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+    let files = [("/shape/src/main.rs".to_owned(), ASYNC_TRAIT_SHAPE.to_owned())];
+    let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+    let user = UserCrate { name: "shape", dir: "/shape/", root: "/shape/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+    let inputs = Inputs::new(&user, &toolchain).expect("fixture and toolchain");
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("resolve the fixture");
+    let sources = [SourceFile { path: "src/main.rs", text: ASYNC_TRAIT_SHAPE }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("inference frame");
+    let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front end");
+    let key_of = |name: &str| names.items(0).find_map(|(key, _, _)| (names.item_text(key)?.name == Some(name)).then_some(key)).expect(name);
+    for (name, error) in [("one", false), ("two", false), ("returned", false), ("returned_bad", true), ("object_bad", true)] {
+        let (types, v) = world.check_borrows(BodyRef::Free(key_of(name)), alloc);
+        assert!(types.is_clean(), "`{name}`'s types: {types:?}");
+        assert!(v.refused.is_none(), "`{name}` refused: {v:?}");
+        assert_eq!(!v.findings.is_empty(), error, "`{name}`: {v:?}");
+    }
+}

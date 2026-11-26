@@ -302,6 +302,10 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.traits_in_scope_logged(&NamesInto(self.reads), module, alloc)
     }
 
+    fn glob_traits<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
+        self.records.glob_traits_logged(&NamesInto(self.reads), module, alloc)
+    }
+
     fn variants(self, owner: ItemKey) -> Option<source::VariantRows<'n>> {
         self.cell(NameCell::Variants { owner });
         self.records.variants(owner)

@@ -1253,6 +1253,21 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 // and a stalled row's finding, should the exact interior fail it, is E0277.
                 err.kind = crate::ty::FulfillErrorKind::Unsatisfied;
             }
+            // Deeper than one impl: hyper-util's `TokioExecutor: HttpServerConnExec<F, B>` is
+            // undecided through `Http2ServerConnExec` and `Executor<H2Stream<F, B>>` down to
+            // what a local async block holds. The solver's own walk says the goal waits on this
+            // body's interior alone: a stalled row re-asks the goal entire on the exact one.
+            if witness == Witness::Fixed
+                && nested.is_none()
+                && ambiguity
+                && ambiguous
+                && err.because.is_none()
+                && matches!(err.obligation.goal, crate::ty::Goal::Trait { .. } | crate::ty::Goal::Projection { .. })
+                && self.undecided_on_local_interior(err.obligation.goal)?
+            {
+                witness = Witness::LocalFlow;
+                err.kind = crate::ty::FulfillErrorKind::Unsatisfied;
+            }
             if witness == Witness::FailedCapture {
                 err.kind = crate::ty::FulfillErrorKind::Unsatisfied;
             }
@@ -1285,6 +1300,19 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                             None => (trait_, ty),
                         };
                         self.stalled.push(crate::stalled::PendingStalled { trait_: row_trait, ty: row_ty, diag });
+                        continue;
+                    }
+                    // A projection undecided only by this body's interior (`.await` of hyper's
+                    // `Connection`: `<Connection<..> as IntoFuture>::IntoFuture == Connection<..>`
+                    // waits on its `Future` impl's where-clauses, down to an async block's
+                    // interior): re-asked entire on the exact interior, its finding E0277's.
+                    (crate::stalled::Interior::Defer, Witness::LocalFlow, crate::ty::Goal::Projection { trait_, args, name, term })
+                        if err.because.is_none() =>
+                    {
+                        let ty = self.ty.list_get(args, 0);
+                        let goal = PendingGoal::Projection { trait_, args, name, term };
+                        let diag = PendingDiag::unmet(DiagCode::Unsatisfied, at, Some(ty), goal, None);
+                        self.stalled.push(crate::stalled::PendingStalled { trait_, ty, diag });
                         continue;
                     }
                     _ => return Err(self.witness_gap_of(witness, at).into()),
@@ -1527,6 +1555,16 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             }
         }
         Ok(None)
+    }
+
+    /// Whether the solver's walk of the undecided `goal` (`TypeCtx::why_maybe_chain`) ends at
+    /// the interior of one of this body's async blocks, still being inferred.
+    fn undecided_on_local_interior(&mut self, goal: Goal) -> Result<bool, Stop> {
+        let mut steps: Vec<crate::diag::PendingWhyStep, Alloc<'a>> = Vec::new_in(self.alloc);
+        Ok(matches!(
+            self.ty.why_maybe_chain(goal, &mut steps, &mut self.reads)?,
+            Some(crate::diag::WhyLeaf::InteriorUnknown { coroutine: crate::diag::WhyDef::Expr(_) })
+        ))
     }
 
     /// [`Self::interior_candidate`] for one impl, in the caller's probe.

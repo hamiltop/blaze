@@ -175,6 +175,8 @@ struct Job<'r> {
     own_crate: Crate<'r>,
     /// Unopened crates of its check scope after crate 0, in reader order.
     rest: SVec<'static, crate::front_load::Unopened>,
+    /// Each scope crate's build-script run by list row ([`HeadsScope::scripts`]).
+    scripts: SVec<'static, (usize, Input)>,
     /// Each scope crate's `CrateScope` name, sorted: what a header read widens to.
     scope: SVec<'static, Name>,
     /// The cells a refusal of its tables is a function of ([`scope_cells`]).
@@ -192,6 +194,11 @@ impl<'r> Job<'r> {
 struct HeadsScope<'r> {
     own: Crate<'r>,
     rest: SVec<'static, crate::front_load::Unopened>,
+    /// Each scope crate with a build script, by list row with its script run's input, sorted:
+    /// what its environment is made of at its first ask (run_names.rs `RunEnvs`), so a text
+    /// read from its `OUT_DIR` (an `include!` of a generated file) is found as the names task
+    /// found it.
+    scripts: SVec<'static, (usize, Input)>,
     lang: SVec<'static, usize>,
     scope: SVec<'static, Name>,
     cut: Option<(usize, crate::engine_bodies::CutWhy)>,
@@ -402,7 +409,17 @@ fn scope_by_need_heads<'r>(
         }
     }
     scope.sort_unstable();
-    Ok(Ok((HeadsScope { own, rest, lang, scope, cut }, whole)))
+    let mut scripts: SVec<'static, (usize, Input)> = SVec::new_in(shared);
+    for row in core::iter::once(at).chain(rest.iter().map(|one| one.world_at)) {
+        if let Ok(Some(script)) = crate::body_types::owner_script(list, row)
+            && let Some(input) = names.input_of(script)
+        {
+            scripts.push((row, input));
+        }
+    }
+    scripts.sort_unstable_by_key(|(row, _)| *row);
+    scripts.dedup_by_key(|(row, _)| *row);
+    Ok(Ok((HeadsScope { own, rest, scripts, lang, scope, cut }, whole)))
 }
 
 /// Builds lightweight crate labels (name, package, world index, and crate key) in `frame` for
@@ -644,7 +661,7 @@ impl HeadsStage {
                         let cells = scope_cells(graph.name, &list, at, Some(&scope), shared);
                         let own = names.input_of(blaze_drive::key::crate_scope_name(&list.key(at))).map(|input| input.name);
                         if let Some(own) = own {
-                            closed_jobs.push((idx, Job { task: *task, krate: list.key(at), own, own_crate: scope.own, rest: scope.rest, scope: scope.scope, cells }));
+                            closed_jobs.push((idx, Job { task: *task, krate: list.key(at), own, own_crate: scope.own, rest: scope.rest, scripts: scope.scripts, scope: scope.scope, cells }));
                         } else {
                             pre_refused.push((idx, "its crate has no names record this command (its `Names` task failed)", cells));
                         }
@@ -747,7 +764,7 @@ impl HeadsStage {
                         refuse(task, "its crate has no names record this command (its `Names` task failed)", &cells, buffer);
                         continue;
                     };
-                    jobs.push(Job { task: *task, krate: list.key(at), own, own_crate: scope.own, rest: scope.rest, scope: scope.scope, cells });
+                    jobs.push(Job { task: *task, krate: list.key(at), own, own_crate: scope.own, rest: scope.rest, scripts: scope.scripts, scope: scope.scope, cells });
                     job_indices.push(idx);
                 }
                 // The crate's names cell and each scope crate's that had records, and the first
@@ -1051,7 +1068,7 @@ fn tables_of(
     let frame = cx.frame();
     let g = heap.alloc();
     let scope_crates = job.scope_crates(scope_records);
-    let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
+    let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, frame, g, snapshot, &job.scripts).map_err(OpenScopeRefused::message)?;
     let records = opened.records;
     let mut rows = Vec::new_in(g);
     if !NamesSource::each_impl_row(records, 0, &mut |row| rows.push(row)) {
@@ -1084,7 +1101,7 @@ fn tables_of(
                     let g = heap.alloc();
                     let chunk_frame = cx.frame();
                     let chunk_crates = job.scope_crates(scope_records);
-                    let opened_chunk = open_scope_by_need(cx, root, fs, outlined, chunk_crates, packs, corrected, procs, chunk_frame, g, snapshot).map_err(OpenScopeRefused::message)?;
+                    let opened_chunk = open_scope_by_need(cx, root, fs, outlined, chunk_crates, packs, corrected, procs, chunk_frame, g, snapshot, &job.scripts).map_err(OpenScopeRefused::message)?;
                     let rec = opened_chunk.records;
                     let recorder = Recorder::new(RecorderOpts { alloc: g });
                     let view = Tables::new(TablesOpts { records: rec, impls: None, lang_crates: &[], reads: &recorder });
@@ -2824,6 +2841,8 @@ struct ItemJob<'r> {
     prefix: [u8; 8],
     own: Crate<'r>,
     rest: SVec<'static, crate::front_load::Unopened>,
+    /// [`HeadsScope::scripts`].
+    scripts: SVec<'static, (usize, Input)>,
     lang: SVec<'static, usize>,
     /// Every crate of its scope had records (else its tasks are refused by name).
     whole: bool,
@@ -3150,6 +3169,7 @@ impl HeadsStage {
             prefix,
             own: scope.own,
             rest: scope.rest,
+            scripts: scope.scripts,
             lang: scope.lang,
             whole,
             cut_words,
@@ -3853,9 +3873,23 @@ fn open_scope_by_need<'n>(
     frame: &'n Frame,
     g: Alloc<'static>,
     snapshot: &'n crate::store::StoreSnapshot,
+    scripts: &'n [(usize, Input)],
 ) -> Result<crate::run_names::Opened<'n>, OpenScopeRefused> {
+    // Every crate's environment made at its first ask, the member's too (run_names.rs
+    // `RunEnvs`, as `names_in` gives a run): a head whose item is in a file its crate's build
+    // script wrote (pprof's `include!(concat!(env!("OUT_DIR"), "/mod.rs"))`) is read from the
+    // script's record, as the names task read it.
+    let mut rows: Vec<usize, &'n Frame> = Vec::new_in(frame);
+    if let crate::run_names::ScopeCrates::ByNeed(scope) = &crates {
+        rows.push(scope.own.world_at);
+        rows.extend(scope.rest.iter().map(|one| one.world_at));
+    }
+    let rows: &'n [usize] = rows.into_bump_slice();
+    let envs: &'n crate::run_names::RunEnvs<'n> = frame.alloc(crate::run_names::RunEnvs::new(packs.list(), rows, scripts, snapshot, packs.home(), frame));
+    let envs = crate::run_names::Envs { owner: None, rest: Some(envs) };
     let packs = ((packs, fs), Some(outlined));
-    crate::run_names::names_records_over(cx, root, crates, packs, corrected, procs, std::vec::Vec::new_in(Global), None, Some(snapshot), None, frame, g)
+    let procs = crate::job_texts::Procs::of(procs);
+    crate::run_names::names_records_envs(cx, root, crates, packs, corrected, procs, std::vec::Vec::new_in(Global), envs, Some(snapshot), None, frame, g)
         .map_err(|_| OpenScopeRefused)
 }
 
@@ -3882,7 +3916,7 @@ fn crate_setup(
 ) -> Result<CrateSetup, &'static str> {
     let frame = cx.frame();
     let g = heap.alloc();
-    let opened = open_scope_by_need(cx, root, fs, outlined, job.scope_crates(scope_records), packs, corrected, procs, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
+    let opened = open_scope_by_need(cx, root, fs, outlined, job.scope_crates(scope_records), packs, corrected, procs, frame, g, snapshot, &job.scripts).map_err(OpenScopeRefused::message)?;
     let records = opened.records;
     let mut lang: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(job.lang.len(), g);
     lang.extend_from_slice(&job.lang);
@@ -3996,7 +4030,7 @@ fn heads_of(
     let frame = cx.frame();
     let g = heap.alloc();
     let scope_crates = job.scope_crates(scope_records);
-    let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
+    let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, frame, g, snapshot, &job.scripts).map_err(OpenScopeRefused::message)?;
     let records = opened.records;
     let CrateSetup { lang, sized, pointers, lang_reads, pointer_reads, members, listing } = *setup;
     let unused = Recorder::new(RecorderOpts { alloc: g });

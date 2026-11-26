@@ -599,6 +599,20 @@ impl<'n> StoreLoad<'n> {
     }
 }
 
+/// The text of file `at` (in the reader's path space) of crate `krate`: its source, else, for a
+/// path under the crate's build-script `OUT_DIR`, the script record's file of that name. A
+/// `mod x;` in a file `include!`d from `OUT_DIR` names a file there (pprof 0.15's generated
+/// `mod.rs`: `pub mod profile;`): the names stage read it from the record (blaze-scope
+/// resolve.rs `file_at`), so its items' rows name it and are read back from the same record.
+pub(crate) fn read_file<'n>(texts: &'n dyn SourceTexts<'n>, krate: usize, at: &str) -> Option<&'n str> {
+    if let Some(text) = texts.read(krate, at) {
+        return Some(text);
+    }
+    let out = texts.crate_env(krate)?.script()?;
+    let file = out.file_at(at)??;
+    core::str::from_utf8(out.bytes_of(file).ok()?).ok()
+}
+
 impl<'n> Load<'n> for StoreLoad<'n> {
     fn names(&self, krate: usize) -> Option<&'n [u8]> {
         self.records_of(krate).map(|c| c.names)
@@ -614,13 +628,13 @@ impl<'n> Load<'n> for StoreLoad<'n> {
 
     fn file(&self, krate: usize, path: PackagePath<'_>) -> Option<&'n str> {
         let at = path.in_package(self.packages.get(krate)?, self.alloc)?;
-        self.texts.read(krate, &at)
+        read_file(self.texts, krate, &at)
     }
 
     fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, surface: ContentId, edition: blaze_surface::Edition, bump: Bump<'n>) -> Result<Option<CurrentFile<'n>>, ItemsRecordError> {
         let Some(package) = self.packages.get(krate) else { return Ok(None) };
         let Some(full) = path.in_package(package, self.alloc) else { return Ok(None) };
-        let Some(text) = self.texts.read(krate, &full) else { return Ok(None) };
+        let Some(text) = read_file(self.texts, krate, &full) else { return Ok(None) };
         // The outline planner covers checkout sources. The packed libraries and the
         // text-only driver supply immutable texts from which the view is made once.
         let (Some(outlines), Some(real)) = (self.outlines, full.strip_prefix("/0/")) else {

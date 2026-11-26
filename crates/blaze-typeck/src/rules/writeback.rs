@@ -753,6 +753,62 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         }
         awaited.sort_unstable_by_key(|r| r.0);
+        // The ADT types proven to run no code on drop at their arguments only once their
+        // fields' projections are normalized (`Checked::no_drop`, rules/promote.rs
+        // `instance_no_drop`), each in a probe: the walk's goals and variables are not kept.
+        // An ADT holding a closure or coroutine of this body (`Map<Iter<u8>, {closure#0}>`)
+        // is skipped: lowering it asks the world for this body's own closure, which is filed
+        // only once this check is clean, so the ask would hole the very check that files it.
+        let mut no_drop: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+        {
+            let view = ex.out.view();
+            let owner = self.body.owner;
+            let mut stack: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+            let mut seen: Vec<bool, Alloc<'a>> = Vec::new_in(alloc);
+            for (idx, n) in view.nodes().enumerate() {
+                if !matches!(n, PNode::Adt(..)) {
+                    continue;
+                }
+                let Ok(ix) = u32::try_from(idx) else { break };
+                let p = PTy(ix);
+                stack.clear();
+                seen.clear();
+                seen.resize(view.len(), false);
+                stack.push(p);
+                let mut own_body = false;
+                while let Some(t) = stack.pop() {
+                    let Some(slot) = seen.get_mut(t.0 as usize) else { continue };
+                    if core::mem::replace(slot, true) {
+                        continue;
+                    }
+                    let node = view.node(t)?;
+                    match node {
+                        PNode::Future(..) => own_body = true,
+                        PNode::Closure { owner: o, .. } | PNode::Coroutine { owner: o, .. } if o == owner => own_body = true,
+                        _ => view.children_of(node, &mut stack)?,
+                    }
+                    if own_body {
+                        break;
+                    }
+                }
+                if own_body {
+                    continue;
+                }
+                let got = self.probe(|m| -> Result<Option<bool>, crate::error::Stop> {
+                    let t = m.lower(view, p, crate::machine::Lower::Body, crate::ty::Cause::Body)?;
+                    m.instance_no_drop(t)
+                });
+                match got {
+                    Ok(Some(true)) => no_drop.push(p),
+                    Ok(_) => {}
+                    // A missing fact holes the run (`reads.holed` below): no row now.
+                    Err(crate::error::Stop::Need(_)) => break,
+                    // A type this walk cannot lower or decide (a limit, a form it does not
+                    // take) is not decided: no row, as for any `None`.
+                    Err(crate::error::Stop::Error(_)) => {}
+                }
+            }
+        }
         // The impl chosen for each projection of a callee's signature at each call
         // (writeback/selected_rows.rs), over the body's own reads: before they are finished.
         let selected = self.selected_rows(&mut ex, &closures, &expr_ty);
@@ -791,6 +847,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             stalled,
             coroutine_witnesses,
             awaited,
+            no_drop,
             selected,
             fru_fields,
             default_fields,

@@ -1689,7 +1689,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     traits.dedup();
     // The traits a block's `use` brings into scope there (tracing's `use
     // $crate::__macro_support::Callsite as _;` in the block its macros expand to).
-    let blocks = super::block_traits::of(names, &store.locals, owner, module, krate, &traits, alloc);
+    let blocks = super::block_traits::of(names, &store.locals, owner, module, &traits, alloc);
     drop(view);
     Ok(Body { item, owner, module, lowered, typeck, tys, params, self_, traits, blocks, type_misses, expanded_text: None, param_subst: None })
 }

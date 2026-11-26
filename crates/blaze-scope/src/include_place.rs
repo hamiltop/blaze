@@ -74,8 +74,19 @@ pub fn served_tree<'p>(package: &'p str, seen: SeenRoot<'_>) -> Option<&'p str> 
 /// nothing is guessed).
 pub fn include_place<'a>(package: &str, seen: Option<SeenRoot<'_>>, calling: &str, written: &str, alloc: Alloc<'a>) -> Option<IncludePlace<'a>> {
     let package = package.trim_end_matches('/');
+    // A member's absolute path under the workspace root it sees but outside its own package
+    // (`/workspace/wit/x.wit`: wasmtime's `bindgen!` writes `include_bytes!` of every WIT file
+    // it read, absolute from `CARGO_MANIFEST_DIR`) is spelled from the workspace root, as the
+    // relative `../../wit/x.wit` is: the same file, the same bound, the same warning.
+    let from_root = match seen {
+        Some(SeenRoot::Member { dir }) if !dir.is_empty() && seen.and_then(|seen| seen.under(written)).is_none() => {
+            written.strip_prefix(blaze_expand::seen::WORKSPACE_ROOT).and_then(|rest| rest.strip_prefix('/')).filter(|rest| !rest.is_empty())
+        }
+        _ => None,
+    };
     let (folder, written) = match seen.and_then(|seen| seen.under(written)) {
         Some(rest) => ("", rest),
+        None if from_root.is_some() => ("", from_root?),
         None => {
             let folder = calling.rsplit_once('/').map_or("", |(dir, _)| dir);
             (folder.strip_prefix(package)?, written)
@@ -86,7 +97,8 @@ pub fn include_place<'a>(package: &str, seen: Option<SeenRoot<'_>>, calling: &st
         Some(seen @ SeenRoot::Member { dir }) => (served_tree(package, seen)?, dir, SourceOrigin::Workspace),
         Some(SeenRoot::Package) | None => (package, "", SourceOrigin::Package),
     };
-    let target = include_target(ReadRoot { origin, package: dir }, folder, written, alloc).ok()?;
+    let spelled_from = if from_root.is_some() { "" } else { dir };
+    let target = include_target(ReadRoot { origin, package: spelled_from }, folder, written, alloc).ok()?;
     let mut own = dir.split('/').filter(|segment| !segment.is_empty());
     let mut ours = target.iter();
     let outside_package = loop {

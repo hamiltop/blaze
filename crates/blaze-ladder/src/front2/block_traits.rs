@@ -22,27 +22,24 @@
 //! - a named or `as _` import: the trait its path names in the type namespace; a path that
 //!   names no trait (a module, a type, a fn, a macro: asked in the value and macro namespaces
 //!   too) brings none;
-//! - a glob: the traits the names library's `traits_in_scope` gives at the glob's module (its
-//!   own, its imports', its globs', its prelude's: the library reads a module's glob the same
-//!   way, visibility aside); an enum's glob brings none.
+//! - a glob: the traits the names library's `glob_traits` gives at the glob's module (its
+//!   own, its imports', its globs', never its prelude's: the library reads a module's glob the
+//!   same way, visibility aside); an enum's glob brings none.
 //!
 //! Refused by name, lazily, at the first method call in a block where the answer depends on
 //! it ([`InScope::Refused`], the body's [`super::world_items::Gap::Local`]): a `use` whose path
 //! does not resolve or resolves only in part ([`UNRESOLVED`], [`PARTIAL`]), a trait alias
 //! imported ([`TRAIT_ALIAS`]) or declared ([`LOCAL_TRAIT_ALIAS`]), a trait declared in a
 //! block whose block module the names library did not make or does not read it in
-//! ([`LocalKind::unplaced`], [`LOCAL_TRAIT`]), a glob of something that is no module or enum ([`GLOB_NOT_MODULE`]), a glob
-//! of a module whose prelude is larger than the body's ([`GLOB_LATER_EDITION`]: its prelude's
-//! traits would be in scope here though the body's prelude has not them), a path through
+//! ([`LocalKind::unplaced`], [`LOCAL_TRAIT`]), a glob of something that is no module or enum ([`GLOB_NOT_MODULE`]), a path through
 //! another block's item that is no type or import ([`THROUGH_LOCAL`]), and import chains or
-//! nesting past their bounds ([`CHAIN`], [`NESTING`]). Known difference, not refused: a glob
-//! read at a body whose module is `#![no_implicit_prelude]` brings the glob module's prelude.
+//! nesting past their bounds ([`CHAIN`], [`NESTING`]).
 
 use blaze_id::ItemKey as LibKey;
 use blaze_own::{AVec, Alloc};
 use blaze_scope::names::{Why as PathWhy, Written};
 use blaze_scope::task::to_path_marked;
-use blaze_surface::{DefKind, Edition, Namespace, PathKind};
+use blaze_surface::{DefKind, Namespace, PathKind};
 use blaze_typeck::ItemKey;
 
 use super::glob_uses::GLOB;
@@ -68,7 +65,6 @@ pub const TRAIT_ALIAS: &str = "a trait alias imported in a block (its traits' me
 pub const LOCAL_TRAIT: &str = "a trait declared in a block whose block's module does not read its name as a trait";
 pub const LOCAL_TRAIT_ALIAS: &str = "a trait alias declared in a block (its traits' methods would be in scope there)";
 pub const GLOB_NOT_MODULE: &str = "a glob use in a block of an item that is no module or enum";
-pub const GLOB_LATER_EDITION: &str = "a glob use in a block of a module whose crate's edition has a larger prelude than the body's";
 pub const THROUGH_LOCAL: &str = "a use declaration in a block whose path starts at a block's item that is no type or import";
 pub const CHAIN: &str = "a use declaration in a block whose path goes through more block imports than the bound";
 pub const NESTING: &str = "a body nested in more items than the bound, whose outer blocks' imports are not read";
@@ -153,16 +149,6 @@ impl BlockTraits {
     }
 }
 
-/// The rank of an edition's standard prelude: 2015 and 2018 share one, 2021 adds to it, 2024
-/// adds again (the Reference, "Preludes", [names.preludes.std]).
-fn prelude_rank(e: Edition) -> u8 {
-    match e {
-        Edition::E2015 | Edition::E2018 => 0,
-        Edition::E2021 => 1,
-        Edition::E2024 => 2,
-    }
-}
-
 /// Whether `segment` is a path head the names library reads itself.
 fn is_head(segment: &str) -> bool {
     matches!(segment, "self" | "super" | "crate" | "$crate")
@@ -173,8 +159,6 @@ struct Reader<'l, 'n, S> {
     names: S,
     locals: &'l Locals<'n>,
     module: LibKey,
-    /// The body's crate's prelude rank; `None`: its edition is not known.
-    rank: Option<u8>,
 }
 
 impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
@@ -334,14 +318,7 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
                 Err(_) => return Err(Self::gap(row, UNRESOLVED)),
             }
         };
-        // The glob's module's prelude must add nothing the body's lacks.
-        let theirs = self.names.crate_of(target).and_then(|k| self.names.edition_of(k)).map(prelude_rank);
-        match (theirs, self.rank) {
-            (Some(t), Some(ours)) if t <= ours => {}
-            (Some(_), Some(_)) => return Err(Self::gap(row, GLOB_LATER_EDITION)),
-            _ => return Err(Self::gap(row, UNRESOLVED)),
-        }
-        let traits = self.names.traits_in_scope(target, alloc).map_err(|_| Self::gap(row, UNRESOLVED))?;
+        let traits = self.names.glob_traits(target, alloc).map_err(|_| Self::gap(row, UNRESOLVED))?;
         for &k in traits.iter() {
             out.push(checker_of(k));
         }
@@ -381,16 +358,15 @@ fn keep_list(keys: &mut AVec<'static, ItemKey>, last: &mut Option<(u32, u32)>, l
     At::Traits { start: s, end: e }
 }
 
-/// The traits in scope at each block of the body `owner` (whose module is `module`, of crate
-/// `krate`) whose list is not `module_traits` (sorted checker keys, the body's `traits`).
+/// The traits in scope at each block of the body `owner` (whose module is `module`) whose list is not `module_traits` (sorted checker keys, the body's `traits`).
 /// Every kept list is in `alloc`; the scratch too.
-pub fn of<'n, S: NamesSource<'n>>(names: S, locals: &Locals<'n>, owner: ItemKey, module: LibKey, krate: usize, module_traits: &[ItemKey], alloc: Alloc<'static>) -> BlockTraits {
+pub fn of<'n, S: NamesSource<'n>>(names: S, locals: &Locals<'n>, owner: ItemKey, module: LibKey, module_traits: &[ItemKey], alloc: Alloc<'static>) -> BlockTraits {
     let mut out = BlockTraits::module(alloc);
     let body = locals.body(owner);
     if body.is_none() && locals.head(owner).is_none() {
         return out;
     }
-    let reader = Reader { names, locals, module, rank: names.edition_of(krate).map(prelude_rank) };
+    let reader = Reader { names, locals, module };
     // The base: the module's traits and those of the blocks around the body's item, when the
     // body is a local item's (its declaration's block, then each block and item outward).
     let mut base: AVec<'static, ItemKey> = AVec::new_in(alloc);
